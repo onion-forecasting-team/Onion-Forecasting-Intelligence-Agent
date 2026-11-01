@@ -15,6 +15,8 @@ sync short-circuits and validation all apply unchanged.
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import math
 from dataclasses import dataclass, field
@@ -439,6 +441,8 @@ def _run(FN, name: str, /, **kwargs) -> ToolOutcome:
     """Call an existing graph handler, converting FastAPI errors to chat-safe errors."""
     try:
         payload = FN(**_callable_kwargs(FN, kwargs))
+        if inspect.isawaitable(payload):
+            payload = asyncio.run(payload)
     except Exception as exc:  # includes fastapi.HTTPException(422/500)
         detail = getattr(exc, "detail", None) or f"{type(exc).__name__}: {exc}"
         return ToolOutcome(name=name, arguments=kwargs, error=str(detail))

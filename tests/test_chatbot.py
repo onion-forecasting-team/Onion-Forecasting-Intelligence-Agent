@@ -120,6 +120,24 @@ def test_tool_catalog_is_read_only():
         assert not any(flag in name for flag in forbidden), f"write-like tool leaked: {name}"
 
 
+def test_graph_tool_awaits_async_handler(monkeypatch):
+    async def async_graph(**kwargs):
+        return {
+            "graph": "ap_price_forecast",
+            "historical": [],
+            "forecast": [],
+        }
+
+    monkeypatch.setattr("main.ap_retail_graph", async_graph)
+    outcome = tools.execute_tool("forecast_ap_prices", {
+        "price_types": ["retail"], "start_date": "2026-10-26", "end_date": "2026-10-30",
+    })
+
+    assert outcome.error is None
+    assert outcome.payload["graph"] == "ap_price_forecast"
+    assert outcome.compact["history_summary"] == []
+
+
 def test_forecast_ap_prices_tool_executes_and_compacts(client):
     outcome = tools.execute_tool("forecast_ap_prices", {
         "price_types": ["retail"], "start_date": "2026-10-26", "end_date": "2026-10-30",

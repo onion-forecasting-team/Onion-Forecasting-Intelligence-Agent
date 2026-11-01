@@ -88,7 +88,7 @@ app.include_router(chat_router)
 
 # Startup event: pre-warm the Chronos-2 pipeline so the first user request does not
 # trigger a cold-start download/init (latency fix #1). We also log the warm-up time.
-@app.add_event_handler("startup")
+@app.on_event("startup")
 async def _prewarm_model_on_startup():
     start = time.time()
     logger.info("Pre-warming Chronos-2 pipeline at server startup...")
