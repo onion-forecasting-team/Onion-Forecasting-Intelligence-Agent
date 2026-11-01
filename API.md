@@ -27,6 +27,20 @@ requests do not require the bearer token.
 
 ---
 
+## Overall forecast confidence explanation
+
+Every Graph 1 and Graph 2 response includes `forecast_overall_confidence` computed from the user's selected forecast range (the `forecast` array). It has four fields:
+
+- **`overall_confidence_score`** (`float`) — mean (average) of all per-day `confidence_score` values across the returned forecast points; the headline reliability number.
+- **`minimum_confidence_score`** (`float`) — the lowest per-day score in the series; the weakest/most pessimistic forecast point.
+- **`final_confidence_score`** (`float`) — the score on the last forecast date (farthest horizon); shows how reliability decays with time.
+- **`forecast_points_for_overall`** (`int`) — how many forecast rows were included (matches the selected `end_date`); explains why a 7-day forecast and a 90-day forecast produce different overall numbers.
+- **`note`** (`str`) — explains the calculation method and notes that this field is not applied to Graph 3 (monthly balance forecasts, since they combine component forecasts without per-day scores).
+
+Not present for Graph 3 (`available: False`).
+
+---
+
 ## 1. Core Forecasting Graph APIs
 
 These endpoints execute Chronos-2 predictions on historical market data and automatically persist forecast runs and quantile values to SQLite.
@@ -168,6 +182,13 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
   "data_staleness_days": 12,
   "forecast_start_date": "2026-10-29",
   "forecast_end_date": "2026-11-30",
+  "forecast_overall_confidence": {
+    "overall_confidence_score": 32.4,
+    "minimum_confidence_score": 28.1,
+    "final_confidence_score": 28.1,
+    "forecast_points_for_overall": 32,
+    "description": "Overall confidence computed over the user's selected forecast range. Mean (overall) = average reliability across all forecast days. Minimum = weakest/most pessimistic point (lowest confidence). Final = confidence at the last forecast date (shows decay over horizon). Points = number of forecast rows included (matches selected end_date). Not applied to Graph 3 (monthly balance forecasts)."
+  },
   "warnings": [
     "Latest observation is 2026-10-15 (14 day(s) behind the server date)."
   ]

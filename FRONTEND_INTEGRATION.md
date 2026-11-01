@@ -24,6 +24,7 @@ the selected display-range length. When a request is truncated, the API warning 
 - `threshold_rs_kg`: optional horizontal chart threshold in INR/kg; defaults to `44`.
 - Response field `threshold_rs_kg`: the effective threshold value used for the chart.
 - `historical`: `date`, `state`, `price_type`, `actual_price_rs_kg`.
+- `forecast_overall_confidence`: mean (`overall_confidence_score`), minimum (`minimum_confidence_score`), and final (`final_confidence_score`) of the per-day `confidence_score` values across the returned forecast array; plus the count (`forecast_points_for_overall`). This reflects the user's selected forecast range automatically (e.g., 7-day horizon = 7 points, 90-day = 90 points). Not present for Graph 3 (monthly balance) since it has no per-day scores.
 - `forecast`: `date`, `state`, `price_type`, `latest_actual_date`, `latest_actual_price_rs_kg`, `predicted_price_rs_kg`, `change_rs_kg`, `change_percent`, `change_direction`, `p10_rs_kg`, `p50_rs_kg`, `p90_rs_kg`, `prediction_interval_width_rs_kg`, `interval_width_pct_of_median`, `confidence_score`.
 - Top-level date/status fields include `visible_start_date`, `visible_end_date`, `actual_end_date`, `requested_end_date`, `last_observation_date`, `data_staleness_days`, `forecast_start_date`, `forecast_end_date`, and `warnings`.
 - If `forecast_truncated` is true, the chart should show the warning and use the returned forecast rows through `forecast_limit_date`; `forecast_end_date` is the last actual forecast point.

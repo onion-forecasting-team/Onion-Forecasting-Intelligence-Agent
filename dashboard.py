@@ -314,6 +314,16 @@ if payload1:
                     f"({forecast_row['date']}) · P10 ₹{forecast_row['p10_rs_kg']:.2f} "
                     f"· P90 ₹{forecast_row['p90_rs_kg']:.2f}{confidence_text}"
                 )
+        # Overall confidence for the selected forecast range (mean / min / final).
+        overall = payload1.get("forecast_overall_confidence")
+        if overall:
+            st.info(
+                f"Overall forecast confidence (this horizon): "
+                f"mean = {overall.get('overall_confidence_score', 'N/A')}% | "
+                f"minimum = {overall.get('minimum_confidence_score', 'N/A')}% | "
+                f"final = {overall.get('final_confidence_score', 'N/A')}%  "
+                f"(computed from {overall.get('forecast_points_for_overall', 0)} forecast points)"
+            )
         with st.expander("Forecast rows / API values"):
             st.dataframe(fdf, use_container_width=True, hide_index=True)
         st.download_button("Download AP price forecast CSV", fdf.to_csv(index=False), file_name=f"ap_price_forecast_{payload1['horizon_days']}d.csv", mime="text/csv", key="g1_download")
@@ -444,6 +454,15 @@ if payload2:
         with st.expander("Comparison forecast rows"):
             st.dataframe(fdf2, use_container_width=True, hide_index=True)
         st.download_button("Download comparison forecast CSV", fdf2.to_csv(index=False), file_name="selected_state_price_forecasts.csv", mime="text/csv", key="g2_download")
+        overall2 = payload2.get("forecast_overall_confidence")
+        if overall2:
+            st.info(
+                f"Overall comparison forecast confidence (this horizon): "
+                f"mean = {overall2.get('overall_confidence_score', 'N/A')}% | "
+                f"minimum = {overall2.get('minimum_confidence_score', 'N/A')}% | "
+                f"final = {overall2.get('final_confidence_score', 'N/A')}%  "
+                f"(from {overall2.get('forecast_points_for_overall', 0)} points)"
+            )
 else:
     st.info("Select states and price types, choose a horizon and click Update state comparison.")
 
@@ -515,6 +534,15 @@ if payload3:
                 "Potential shortfall" if shortfall > 0 else "Potential surplus",
                 delta_color="inverse" if shortfall > 0 else "normal",
                 help=f"Forecast month: {pd.to_datetime(latest_balance['date']).strftime('%B %Y')}",
+            )
+        # Show overall confidence for the selected forecast range (Graph 1/2 style note).
+        overall3 = payload3.get("forecast_overall_confidence")
+        if overall3 and overall3.get("available") is not False:
+            st.info(
+                f"Overall supply-demand forecast confidence (this horizon): "
+                f"mean = {overall3.get('overall_confidence_score', 'N/A')}% | "
+                f"minimum = {overall3.get('minimum_confidence_score', 'N/A')}% | "
+                f"final = {overall3.get('final_confidence_score', 'N/A')}%"
             )
 
         st.markdown("#### Monthly quantities")

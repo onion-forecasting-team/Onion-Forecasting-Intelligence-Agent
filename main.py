@@ -671,7 +671,9 @@ async def ap_retail_graph(
                 price_type: ["timestamp", *_price_context_columns("AP", price_type)]
                 for price_type in ("retail", "wholesale", "mandi_modal")
             },
-            "historical": historical, "forecast": forecast, "metadata": _metadata(), "saved_to_sqlite": saved,
+            "historical": historical, "forecast": forecast,
+            "forecast_overall_confidence": _overall_confidence_scores(forecast),
+            "metadata": _metadata(), "saved_to_sqlite": saved,
             **status,
             "forecast_start_date": forecast_display_start.isoformat() if forecast_display_start else None,
             "forecast_end_date": max((r["date"] for r in forecast), default=None)}
@@ -758,6 +760,7 @@ async def state_comparison_graph(
         "actual_end_date": actual_end_date.isoformat(),
         "historical": historical,
         "forecast": forecast,
+        "forecast_overall_confidence": _overall_confidence_scores(forecast),
         "metadata": _metadata(),
         "saved_to_sqlite": saved,
         **status,
@@ -926,6 +929,8 @@ def supply_balance_graph(
             "requested_end_date": end_date.isoformat(),
             "forecast_limit_date": forecast_limit_end.isoformat(),
             "forecast_truncated": forecast_limit_end < end_date,
+            "forecast_overall_confidence": {"available": False,
+                                            "note": "Overall confidence applies to Graph 1/2 daily price forecasts only; Graph 3 uses separate monthly component forecasts without per-day confidence."},
             "saved_to_sqlite": saved, **status,
             "forecast_end_date": max((r["date"] for r in forecast_rows), default=None)}
 
