@@ -15,8 +15,8 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(ROOT, ".env"))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(ROOT, "config", ".env"))
 
 st.set_page_config(page_title="AP Civil Supplies · Onion Outlook", page_icon="🧅", layout="wide")
 

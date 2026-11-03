@@ -26,9 +26,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROJECT = Path(__file__).resolve().parent
+PROJECT = Path(__file__).resolve().parent.parent.parent
 TASK_NAME = "OnionUPAgDash6h"
-TASK_CONFIG_SCRIPT = PROJECT / "configure_scheduler_6h.ps1"
+TASK_CONFIG_SCRIPT = PROJECT / "scripts" / "configure_scheduler_6h.ps1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 
@@ -38,7 +38,7 @@ os.chdir(PROJECT)
 
 def _env_flag(name: str, default: str = "1") -> bool:
     from dotenv import dotenv_values
-    values = dotenv_values(PROJECT / ".env")
+    values = dotenv_values(PROJECT / "config" / ".env")
     return str(values.get(name, default)).strip().lower() == "1"
 
 

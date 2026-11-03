@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$projectRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
-$job = Join-Path $projectRoot "pull_upag_dash.py"
+$job = Join-Path $projectRoot "src\data_layer\pull_upag_dash.py"
 
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw ".venv\Scripts\python.exe is missing. Run setup_windows.bat first."

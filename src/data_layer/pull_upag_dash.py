@@ -25,6 +25,8 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ui"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from typing import Any
 
 import pandas as pd
@@ -34,8 +36,8 @@ import dash_client
 import dash_extract
 import history_store
 
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(ROOT / "config" / ".env")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("onion-dash-ingestion")
 

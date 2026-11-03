@@ -17,8 +17,8 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(ROOT / "config" / ".env")
 DEFAULT_BASE = os.getenv("UPAG_BASE_URL", "https://data.upag.gov.in").rstrip("/")
 LOGIN_PATH = "/v1/upag/api-data-share/login"
 SOURCES_PATH = "/v1/upag/api-data-share/sources/user-allowed-sources"

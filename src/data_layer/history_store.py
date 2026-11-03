@@ -24,8 +24,8 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(ROOT / "config" / ".env")
 DEFAULT_CSV = ROOT / "data" / "Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv"
 DEFAULT_DAILY_PRICE_CSV = ROOT / "data" / "Onion_Daily_Price_Forecasting_Dataset_2022-01-01_to_2026-10-25.csv"
 DEFAULT_AP_MONTHLY_CSV = ROOT / "data" / "Onion_AP_Monthly_Dataset_2022-01_to_2026-10.csv"

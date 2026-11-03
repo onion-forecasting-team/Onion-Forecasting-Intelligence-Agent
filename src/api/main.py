@@ -27,6 +27,9 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src" / "data_layer"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 from history_store import (
     CSV_PATH, DB_PATH,
     PRICE_COLUMNS, QUANTITY_COLUMNS,
@@ -35,8 +38,8 @@ from history_store import (
     sync_model_ready_csv,
 )
 
-ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(ROOT / "config" / ".env")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("onion-forecast-api")
 MODEL_ID = os.getenv("CHRONOS_MODEL_ID", "amazon/chronos-2")
