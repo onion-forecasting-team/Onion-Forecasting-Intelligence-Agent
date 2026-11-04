@@ -1,6 +1,6 @@
 """Graph-specific Chronos-2 forecasting API for the onion forecasting MVP.
 
-Daily observation prices are stored in SQLite as INR per metric quintal. Chronos-2
+Daily observation prices are stored in MongoDB as INR per metric quintal. Chronos-2
 sees those source units; only predicted price quantiles are converted to INR/kg before
 being returned and persisted in forecast_values. Graph 3 monthly observations and
 forecasts remain in tonnes per month.
@@ -31,12 +31,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src" / "data_layer"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 from history_store import (
-    CSV_PATH, DB_PATH,
-    PRICE_COLUMNS, QUANTITY_COLUMNS,
+    CSV_PATH, PRICE_COLUMNS, QUANTITY_COLUMNS,
     STATE_CODES, STATE_NAMES, get_latest_forecast, ingestion_status, list_forecast_runs,
     load_ap_monthly_history, load_daily_price_history, save_forecast_run,
     sync_model_ready_csv,
 )
+import history_store  # for store_label() (MongoDB store identity in /health)
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / "config" / ".env")
@@ -64,7 +64,7 @@ app = FastAPI(
     version="3.0.0",
     description=(
         "Graph-specific Chronos-2 forecasts. Historical price observations are stored in ₹/metric quintal; "
-        "forecasted prices are converted to ₹/kg and persisted to SQLite."
+        "forecasted prices are converted to ₹/kg and persisted to MongoDB."
     ),
 )
 
@@ -72,9 +72,12 @@ app = FastAPI(
 from chatbot.chat_router import router as chat_router  # noqa: E402
 
 # Register CORS AFTER the authentication middleware.
+# Default: allow every origin ("*"). Override with CORS_ORIGINS in config/.env
+# (comma-separated, e.g. "http://localhost:3000,http://192.168.1.245:8080")
+# to restrict where a browser may call this API from.
 allowed_origins = [
     x.strip()
-    for x in os.getenv("CORS_ORIGINS", "*,http://192.168.1.245:8080").split(",")
+    for x in os.getenv("CORS_ORIGINS", "*").split(",")
     if x.strip()
 ]
 
@@ -272,11 +275,11 @@ def _run_target(data: pd.DataFrame, target: str, horizon: int,
     context_covariates = list(context_covariates or [])
     if target not in data.columns:
         raise HTTPException(
-            status_code=500, detail=f"Missing target column {target} in SQLite history.")
+            status_code=500, detail=f"Missing target column {target} in the history store.")
     for col in context_covariates:
         if col not in data.columns:
             raise HTTPException(
-                status_code=500, detail=f"Missing context column {col} in SQLite history.")
+                status_code=500, detail=f"Missing context column {col} in the history store.")
     selected_cols = list(dict.fromkeys(
         ["item_id", "timestamp", *context_covariates, target]))
     context = data[selected_cols].copy()
@@ -560,8 +563,12 @@ def root() -> dict:
 @app.get("/health")
 def health() -> dict:
     data = get_data()
+    try:
+        store = history_store.store_label()
+    except Exception:
+        store = "mongodb://(MONGO_URI not configured)"
     return {"status": "ok", "model_loaded": get_pipeline.cache_info().currsize > 0, "model_id": MODEL_ID,
-            "history_db": str(DB_PATH), "ingestion": ingestion_status(), **_status(data)}
+            "history_db": store, "store_engine": "mongodb", "ingestion": ingestion_status(), **_status(data)}
 
 
 @app.get("/api/data/status")

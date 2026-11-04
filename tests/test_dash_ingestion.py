@@ -4,12 +4,13 @@ Covers dash_client payload building, dash_extract parsing/mapping/units/anchors,
 history_store.upsert_dash_observations append/correct/gapfill semantics, the
 pull_upag_dash window planning + lock, and full --dry-run / --once runs with a
 stubbed network layer. No requests leave this machine.
+
+Store: MongoDB backend (test database `onion_forecasting_test`, recreated per test).
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -18,12 +19,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import db_client  # noqa: E402
 import dash_client  # noqa: E402
 import dash_extract  # noqa: E402
 import history_store  # noqa: E402
 import pull_upag_dash  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+TEST_DB_NAME = "onion_forecasting_test"
 
 AP_RETAIL = history_store.PRICE_COLUMNS["AP"]["retail"]
 AP_WHOLESALE = history_store.PRICE_COLUMNS["AP"]["wholesale"]
@@ -47,8 +51,9 @@ def make_row(state_code: str, day: str, sub_category: str, value: float,
 
 
 def seed_history(tmp_path: Path, monkeypatch, days: int = 3, end: str = "2026-10-26") -> None:
-    """Small complete observation history inside a temp SQLite DB."""
-    monkeypatch.setattr(history_store, "DB_PATH", tmp_path / "test.sqlite3")
+    """Small complete observation history inside the throwaway MongoDB test DB."""
+    monkeypatch.setenv("MONGO_DB_NAME", TEST_DB_NAME)
+    db_client.drop_database_collections(TEST_DB_NAME)
     # The tests build their own small history; never auto-import the project CSV here.
     monkeypatch.setattr(history_store, "ensure_store_ready", lambda: None)
     timestamps = pd.date_range(end=pd.Timestamp(end), periods=days, freq="D")
@@ -63,9 +68,8 @@ def seed_history(tmp_path: Path, monkeypatch, days: int = 3, end: str = "2026-10
 
 
 def observation_row(date_iso: str) -> dict:
-    with history_store.connect() as conn:
-        row = conn.execute('SELECT * FROM "observations" WHERE "timestamp"=?', (date_iso,)).fetchone()
-    return dict(row) if row is not None else {}
+    doc = db_client.get_db(TEST_DB_NAME).observations.find_one({"_id": date_iso}, {"_id": 0})
+    return dict(doc) if doc is not None else {}
 
 
 # ---------------------------------------------------------------------------
@@ -331,24 +335,25 @@ def _isolate_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(history_store, "ensure_store_ready", lambda: None)
     monkeypatch.setenv("UPAG_DASH_SNAPSHOTS", "0")
     monkeypatch.setenv("UPAG_DASH_ENABLED", "1")
-    with history_store.connect() as conn:
-        history_store._create_schema(conn)
-        daily_columns = history_store.DAILY_GRAPH_COLUMNS
-        quoted_columns = ",".join(f'"{column}"' for column in daily_columns)
-        source_rows = conn.execute(
-            f'SELECT {quoted_columns} FROM observations ORDER BY timestamp').fetchall()
-        placeholders = ",".join("?" for _ in daily_columns)
-        conn.executemany(
-            f'INSERT OR REPLACE INTO daily_price_observations ({quoted_columns}) '
-            f'VALUES ({placeholders})',
-            [tuple(row) for row in source_rows],
-        )
-        conn.execute(
-            """INSERT OR REPLACE INTO ap_monthly_observations
-            (month_start, production_t_month, consumption_t_month, arrival_t_month)
-            VALUES('2026-10-01', 52000, 69000, 3000)"""
-        )
-    daily_source = pd.DataFrame([tuple(row) for row in source_rows], columns=daily_columns)
+    db = db_client.get_db(TEST_DB_NAME)
+    # Mirror the legacy full history into the daily graph collection.
+    daily_columns = history_store.DAILY_GRAPH_COLUMNS
+    source_rows = list(db.observations.find(
+        {}, {column: 1 for column in daily_columns} | {"_id": 0},
+        sort=[("timestamp", 1)]))
+    daily = db.daily_price_observations
+    for row in source_rows:
+        plain = dict(row)
+        plain["_id"] = plain["timestamp"]
+        daily.replace_one({"_id": plain["_id"]}, {k: v for k, v in plain.items() if k != "_id"},
+                          upsert=True)
+    db.ap_monthly_observations.update_one(
+        {"_id": "2026-10-01"},
+        {"$set": {"month_start": "2026-10-01", "production_t_month": 52000,
+                  "consumption_t_month": 69000, "arrival_t_month": 3000}},
+        upsert=True,
+    )
+    daily_source = pd.DataFrame(source_rows, columns=daily_columns)
     daily_csv = pd.DataFrame({
         "date": [
             f"{stamp.month}/{stamp.day}/{stamp.year}"
@@ -377,9 +382,9 @@ def test_run_once_dry_run_writes_nothing(tmp_path, monkeypatch):
     _stub_fetch(monkeypatch, {"MP": mp_rows})
     exit_code = pull_upag_dash.main(["--dry-run", "--states", "MP"])
     assert exit_code == 0
-    with history_store.connect() as conn:
-        count = conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"]
-        logs = conn.execute("SELECT COUNT(*) AS n FROM ingestion_log").fetchone()["n"]
+    db = db_client.get_db(TEST_DB_NAME)
+    count = db.observations.count_documents({})
+    logs = db.ingestion_log.count_documents({})
     assert count == 3  # dry-run must not add rows
     assert logs == 1   # only the seed import's own audit row; the run adds none
     assert not (tmp_path / "corrections_log.csv").exists()
@@ -400,9 +405,10 @@ def test_run_once_appends_yesterday(tmp_path, monkeypatch):
     assert row[MP_RETAIL] == pytest.approx(2605.0)
     assert row["MP_production_metric_quintal_per_day"] == pytest.approx(20000.0)  # forward-filled
     assert row["source"] == "upag_dash_6h"
-    with history_store.connect() as conn:
-        latest = conn.execute("SELECT source, status, inserted FROM ingestion_log "
-                              "ORDER BY id DESC LIMIT 1").fetchone()
+    db = db_client.get_db(TEST_DB_NAME)
+    latest = db.ingestion_log.find_one({"source": {"$exists": True}},
+                                       {"_id": 0, "source": 1, "status": 1, "inserted": 1},
+                                       sort=[("id", -1)])
     assert latest["source"] == "upag_dash_6h" and latest["status"] == "success"
     assert latest["inserted"] == 1
     assert not (tmp_path / "pull.lock").exists()
@@ -422,13 +428,10 @@ def test_run_once_writes_graph_tables_in_their_dataset_units(tmp_path, monkeypat
     exit_code = pull_upag_dash.main(["--once", "--states", "AP"])
     assert exit_code == 0
 
-    with history_store.connect() as conn:
-        daily = conn.execute(
-            'SELECT * FROM daily_price_observations WHERE timestamp=?', ("2026-10-27",)
-        ).fetchone()
-        monthly = conn.execute(
-            'SELECT * FROM ap_monthly_observations WHERE month_start=?', ("2026-10-01",)
-        ).fetchone()
+    db = db_client.get_db(TEST_DB_NAME)
+    daily = db.daily_price_observations.find_one({"_id": "2026-10-27"}, {"_id": 0})
+    monthly = db.ap_monthly_observations.find_one({"_id": "2026-10-01"}, {"_id": 0})
+    assert daily is not None and monthly is not None
     assert daily["AP_retail_rs_per_metric_quintal"] == pytest.approx(4100.0)
     assert daily["AP_arrival_metric_quintal"] == pytest.approx(20.0)
     assert daily["MP_retail_rs_per_metric_quintal"] == pytest.approx(4000.0)
@@ -452,8 +455,8 @@ def test_run_once_state_failure_isolation(tmp_path, monkeypatch):
     exit_code = pull_upag_dash.main(["--once", "--states", "AP,MP"])
     assert exit_code == 1
     assert observation_row("2026-10-27")[MP_RETAIL] == pytest.approx(2605.0)  # MP still ingested
-    with history_store.connect() as conn:
-        errors = conn.execute("SELECT source FROM ingestion_log WHERE status='error'").fetchall()
+    db = db_client.get_db(TEST_DB_NAME)
+    errors = list(db.ingestion_log.find({"status": "error"}, {"_id": 0, "source": 1}))
     assert any("AP" in e["source"] for e in errors)
 
 

@@ -181,7 +181,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "get_saved_forecast",
             "description": (
-                "Fetch the latest forecast run persisted in SQLite (by Graph 1/2/3 calls) with its saved "
+                "Fetch the latest forecast run persisted in the MongoDB store (by Graph 1/2/3 calls) with its saved "
                 "predicted values, lower bounds and upper bounds. "
                 "Use for 'repeat the last saved forecast' style questions."),
             "parameters": {

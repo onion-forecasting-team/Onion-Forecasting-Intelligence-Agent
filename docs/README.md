@@ -1,13 +1,13 @@
 # Onion Forecasting MVP — Chronos-2 + FastAPI + Streamlit
 
-This project is a local, runnable MVP using separate daily price and AP monthly quantity datasets. Graph-specific observations are synchronized into SQLite before forecasting.
+This project is a local, runnable MVP using separate daily price and AP monthly quantity datasets. Graph-specific observations are synchronized into MongoDB before forecasting.
 
 ## What is included
 
 - **Graph 1 API/UI:** Forecasts AP retail, wholesale, and mandi modal prices using the specified AP price and arrival history.
 - **Graph 2 API/UI:** Forecasts retail, wholesale, and mandi modal prices independently for AP, MH, KA, and MP using only each selected state's matching price and arrival history.
 - **Graph 3 API/UI:** Forecasts AP monthly production, consumption, and arrivals in tonnes/month, then derives shortfall as `consumption - (arrival + production)`.
-- **SQLite history store:** Automatically synchronizes the configured daily price CSV and monthly AP CSV into separate graph-specific SQLite tables. Source changes are reloaded on the next graph request. The existing full-schema ingestion store remains available for its existing ingestion workflows.
+- **MongoDB history store:** Automatically synchronizes the configured daily price CSV and monthly AP CSV into separate graph-specific MongoDB collections. Source changes are reloaded on the next graph request. The existing full-schema ingestion store (now backed by MongoDB) remains available for its existing ingestion workflows. The pre-migration SQLite file is retained read-only as a backup for `scripts/verify_migration.py`.
 - **UPAg discovery utility:** Uses credentials from local `.env`, logs into the official UPAg Open API, lists the source names permitted for that account, and can save raw JSON responses when a source-specific request payload is provided.
 - **Mocked API tests:** Check request/response structure without downloading Chronos-2 model weights.
 
@@ -79,9 +79,11 @@ GET http://127.0.0.1:8000/api/ingestion/status
 
 ## History store and CSV updates
 
-The existing full-schema ingestion store is initialized from its configured legacy CSV when required. Graph requests separately synchronize the new daily and monthly datasets into graph-specific tables in the configured SQLite database (default: `data/onion_forecasting_v4.sqlite3`). The SQLite file is ignored by Git and is created locally.
+The existing full-schema ingestion store is initialized from its configured legacy CSV when required. Graph requests separately synchronize the new daily and monthly datasets into graph-specific collections in the configured MongoDB database (`MONGO_DB_NAME`, default: `onion_forecasting`; connection via `MONGO_URI` in `config/.env`). Collections mirror the former SQLite tables 1:1 (same field names); the legacy `data/onion_forecasting_v4.sqlite3` file is retained only as a verified backup.
 
-Graphs 1 and 2 instead read the daily dataset configured by `ONION_DAILY_PRICE_DATA_PATH`; Graph 3 reads the monthly AP dataset configured by `ONION_AP_MONTHLY_DATA_PATH`. The supplied defaults point to the two CSV paths provided for this change. Set these variables in `.env` if the files are stored elsewhere. The API validates each dataset and synchronizes it into `daily_price_observations` or `ap_monthly_observations` in the same SQLite database. These graph endpoints do not use the legacy combined model-ready CSV as their observation source.
+> **Migrating from SQLite?** See [`MONGO_MIGRATION.md`](MONGO_MIGRATION.md) for the end-to-end record: why the store was converted, the techniques used (upserts, counters, aggregation pipelines, index plan), the verification/parity methodology, and the ops/rollback runbook.
+
+Graphs 1 and 2 instead read the daily dataset configured by `ONION_DAILY_PRICE_DATA_PATH`; Graph 3 reads the monthly AP dataset configured by `ONION_AP_MONTHLY_DATA_PATH`. The supplied defaults point to the two CSV paths provided for this change. Set these variables in `.env` if the files are stored elsewhere. The API validates each dataset and synchronizes it into the `daily_price_observations` or `ap_monthly_observations` collection in the MongoDB store. These graph endpoints do not use the legacy combined model-ready CSV as their observation source.
 
 If you receive a newer **full combined model-ready** CSV, put it inside `data/` and import it:
 
@@ -125,7 +127,7 @@ Before turning polling on, the next implementation step is a source adapter that
 
 ## Automated 6-hourly UPAg Dash ingestion
 
-`pull_upag_dash.py` keeps the SQLite history and daily price CSV current. Every run:
+`pull_upag_dash.py` keeps the MongoDB history and daily price CSV current. Every run:
 
 1. Requests **yesterday's date** (Asia/Kolkata) from the public UPAg Dash MIP by-crop endpoint for all four states (AP, MH, KA, MP).
 2. Extracts the four sourced series per state — **retail, wholesale and mandi modal prices (Rs/Qtl, unconverted)** and **mandi arrivals (Tonnes ×10 → metric quintals)**.
@@ -156,7 +158,7 @@ install above remains the default and is independent of the backend.
 
 Every run is auditable in `ingestion_log`, and raw responses are snapshotted under `data/snapshots/` (newest 30 kept). Environment switches live in `.env` (`UPAG_DASH_ENABLED`, `UPAG_DASH_DAYS`, `UPAG_DASH_SNAPSHOTS`, `UPAG_DASH_UPDATE_EXISTING`, …). Lock file `data/pull_upag_dash.lock` prevents overlapping runs. Offline tests: `pytest tests\test_dash_ingestion.py`.
 
-The scheduled job fetches UPAg Dash data and writes it to SQLite and the configured daily price CSV; it does not call the local FastAPI HTTP API. The monthly source CSV is unchanged; AP monthly arrivals are refreshed only in the SQLite graph table, while monthly production and consumption remain sourced from the configured monthly dataset. The API reads the updated database when its data endpoints are requested. If an AP monthly row is not yet present, the job reports that its arrival total could not be updated; it does not invent monthly production or consumption values.
+The scheduled job fetches UPAg Dash data and writes it to MongoDB and the configured daily price CSV; it does not call the local FastAPI HTTP API. The monthly source CSV is unchanged; AP monthly arrivals are refreshed only in the MongoDB graph collection, while monthly production and consumption remain sourced from the configured monthly dataset. The API reads the updated store when its data endpoints are requested. If an AP monthly row is not yet present, the job reports that its arrival total could not be updated; it does not invent monthly production or consumption values.
 
 ## Chronos-2 output interpretation
 

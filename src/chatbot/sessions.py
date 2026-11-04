@@ -1,39 +1,24 @@
-"""Chat session/message persistence in the shared SQLite store.
+"""Chat session/message persistence in the shared MongoDB store.
 
-Uses history_store.connect() (same WAL SQLite DB as observations/forecasts) so
-the chatbot adds two tables without touching any existing schema or code.
-Chart payloads are NOT persisted — replaying a chart means a fresh API call;
-forecast numbers themselves live in forecast_runs/forecast_values already.
+Replaces the former SQLite chat tables with two MongoDB collections that keep
+the SAME document fields, so the chatbot's contract is unchanged:
+  chat_sessions : {session_id, created_at, updated_at, user_label, title}
+  chat_messages : {seq, session_id, role, content, tools_used(json str), chart_kind, created_at}
+
+`list_sessions` counts messages live via a $lookup aggregation (replaces the
+SQL correlated subquery) and never needs idempotent DDL — MongoDB is
+schemaless. Chart payloads are NOT persisted — replaying a chart means a
+fresh API call; forecast numbers themselves live in forecast_runs/
+forecast_values already.
 """
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from history_store import connect
-
-CHAT_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS chat_sessions (
-    session_id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    user_label TEXT,
-    title TEXT NOT NULL DEFAULT 'New chat'
-);
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL REFERENCES chat_sessions(session_id),
-    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-    content TEXT NOT NULL,
-    tools_used TEXT,
-    chart_kind TEXT,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);
-"""
+from db_client import COUNTER_IDS, SCHEMA_VERSION, ensure_indexes, get_db, next_sequence
 
 DEFAULT_TITLE = "New chat"
 _TITLE_LIMIT = 48
@@ -43,58 +28,45 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _create_chat_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(CHAT_SCHEMA_SQL)
-
-
 def ensure_chat_schema() -> None:
-    """Idempotent DDL; cheap enough to run per chat request (CREATE IF NOT EXISTS)."""
-    with connect() as conn:
-        _create_chat_schema(conn)
+    """Idempotent index setup (replaces CREATE TABLE IF NOT EXISTS)."""
+    ensure_indexes(get_db())
 
 
 def create_session(user_label: str | None = None, title: str = DEFAULT_TITLE) -> dict[str, Any]:
-    ensure_chat_schema()
-    session = {
+    db = get_db()
+    session_doc = {
         "session_id": uuid.uuid4().hex,
         "created_at": _now(),
         "updated_at": _now(),
         "user_label": user_label,
         "title": title,
+        "messages_count": 0,
+        "version": SCHEMA_VERSION,
     }
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO chat_sessions(session_id,created_at,updated_at,user_label,title) VALUES(?,?,?,?,?)",
-            (session["session_id"], session["created_at"], session["updated_at"],
-             session["user_label"], session["title"]),
-        )
-        conn.commit()
-    return session
+    db.chat_sessions.insert_one(session_doc)
+    return {key: session_doc[key] for key in
+            ("session_id", "created_at", "updated_at", "user_label", "title")}
 
 
 def get_session(session_id: str) -> dict[str, Any] | None:
-    ensure_chat_schema()
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT session_id,created_at,updated_at,user_label,title FROM chat_sessions WHERE session_id=?",
-            (session_id,),
-        ).fetchone()
-    return dict(row) if row else None
+    doc = get_db().chat_sessions.find_one(
+        {"session_id": session_id},
+        {"_id": 0, "messages_count": 0, "version": 0},
+    )
+    return doc
 
 
 def touch_session(session_id: str) -> None:
-    with connect() as conn:
-        conn.execute("UPDATE chat_sessions SET updated_at=? WHERE session_id=?", (_now(), session_id))
-        conn.commit()
+    get_db().chat_sessions.update_one(
+        {"session_id": session_id}, {"$set": {"updated_at": _now()}})
 
 
 def set_session_title(session_id: str, title: str) -> None:
-    with connect() as conn:
-        conn.execute(
-            "UPDATE chat_sessions SET title=?, updated_at=? WHERE session_id=?",
-            (title.strip()[:_TITLE_LIMIT] or DEFAULT_TITLE, _now(), session_id),
-        )
-        conn.commit()
+    get_db().chat_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {"title": title.strip()[:_TITLE_LIMIT] or DEFAULT_TITLE,
+                  "updated_at": _now()}})
 
 
 def auto_title_if_default(session_id: str, first_message: str) -> bool:
@@ -108,15 +80,18 @@ def auto_title_if_default(session_id: str, first_message: str) -> bool:
 
 def append_message(session_id: str, role: str, content: str,
                    tools_used: list[str] | None = None, chart_kind: str | None = None) -> None:
-    ensure_chat_schema()
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO chat_messages(session_id,role,content,tools_used,chart_kind,created_at) VALUES(?,?,?,?,?,?)",
-            (session_id, role, content,
-             json.dumps(tools_used or [], ensure_ascii=False),
-             chart_kind, _now()),
-        )
-        conn.commit()
+    db = get_db()
+    ensure_indexes(db)
+    db.chat_messages.insert_one({
+        "seq": next_sequence(db, COUNTER_IDS["chat_messages"]),
+        "session_id": session_id,
+        "role": role,
+        "content": content,
+        "tools_used": json.dumps(tools_used or [], ensure_ascii=False),
+        "chart_kind": chart_kind,
+        "created_at": _now(),
+        "version": SCHEMA_VERSION,
+    })
     touch_session(session_id)
 
 
@@ -124,29 +99,40 @@ def get_history(session_id: str, limit: int = 10) -> list[dict[str, Any]]:
     """Newest-last conversation slice (role/content only for the LLM)."""
     ensure_chat_schema()
     safe_limit = max(1, min(int(limit), 200))
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT id,role,content,tools_used,chart_kind,created_at FROM chat_messages "
-            "WHERE session_id=? ORDER BY id DESC LIMIT ?",
-            (session_id, safe_limit),
-        ).fetchall()
-    return [dict(r) for r in reversed(rows)]
+    docs = list(get_db().chat_messages.find(
+        {"session_id": session_id},
+        {"_id": 0, "version": 0},  # `version` is bookkeeping; never leaks to API responses
+        sort=[("seq", -1)],
+        limit=safe_limit,
+    ))
+    # Keep the former row shape with integer `id` (SQLite parity).
+    return [{**doc, "id": doc["seq"]} for doc in reversed(docs)]
 
 
 def message_count(session_id: str) -> int:
-    with connect() as conn:
-        return int(conn.execute(
-            "SELECT COUNT(*) AS n FROM chat_messages WHERE session_id=?", (session_id,)).fetchone()["n"])
+    return int(get_db().chat_messages.count_documents({"session_id": session_id}))
 
 
 def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
     ensure_chat_schema()
     safe_limit = max(1, min(int(limit), 200))
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT s.session_id, s.title, s.created_at, s.updated_at, s.user_label, "
-            "(SELECT COUNT(*) FROM chat_messages m WHERE m.session_id=s.session_id) AS messages_count "
-            "FROM chat_sessions s ORDER BY s.updated_at DESC, s.created_at DESC LIMIT ?",
-            (safe_limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    pipeline = [
+        {"$lookup": {
+            "from": "chat_messages",
+            "localField": "session_id",
+            "foreignField": "session_id",
+            "as": "messages",
+        }},
+        {"$project": {
+            "_id": 0,
+            "session_id": 1,
+            "title": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "user_label": 1,
+            "messages_count": {"$size": "$messages"},
+        }},
+        {"$sort": {"updated_at": -1, "created_at": -1}},
+        {"$limit": safe_limit},
+    ]
+    return list(get_db().chat_sessions.aggregate(pipeline))

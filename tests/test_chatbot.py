@@ -16,11 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest
 from fastapi.testclient import TestClient
 
+import db_client
 import chatbot.agent as agent
 import chatbot.sessions as sessions
 import chatbot.tools as tools
 import history_store
-from test_api_mocked import client_with_fake
+from test_api_mocked import client_with_fake, TEST_DB_NAME
 
 AUTH = {"Authorization": "Bearer test-api-token"}
 
@@ -103,9 +104,7 @@ def post_chat(client: TestClient, message: str, session_id: str | None = None):
 
 
 def _observation_row_count() -> int:
-    with history_store.connect() as conn:
-        history_store._create_schema(conn)
-        return int(conn.execute("SELECT COUNT(*) c FROM observations").fetchone()["c"])
+    return int(db_client.get_db(TEST_DB_NAME).observations.count_documents({}))
 
 
 # ---------------------------------------------------------------------------
@@ -430,24 +429,29 @@ def test_chat_input_too_long_is_422(client, monkeypatch):
 
 
 def test_fallback_model_chain(monkeypatch):
-    """Primary fails → retry → fallback answers. Verifies the chain order."""
+    """Primary fails → retry → fallback answers. Verifies the chain order.
+
+    No model names are hardcoded: the chain is defined by agent._cfg()'s
+    [model, fallback_model] pair whatever the environment configures."""
     monkeypatch.setenv("CHAT_RETRY_DELAY_SEC", "0")
+    cfg = agent._cfg()
+    primary_model, fallback_model = cfg["model"], cfg["fallback_model"]
     monkeypatch.setattr(agent, "_get_client", lambda: object())
     attempts: list[str] = []
 
     def flaky_complete(client, model, messages, use_tools):
         attempts.append(model)
-        if model == agent._cfg()["model"]:
+        if model == primary_model:
             raise RuntimeError("synthetic primary outage")
         return _FakeMessage(content="fallback answer")
 
     monkeypatch.setattr(agent, "_complete_turn", flaky_complete)
     message, model = agent._call_model_with_fallback(
         object(), [{"role": "user", "content": "hi"}], use_tools=False)
-    assert model == "llama-3.1-8b-instant"
+    assert model == fallback_model
     assert message.content == "fallback answer"
     # primary once → fallback once (the chain in agent.py)
-    assert attempts == ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    assert attempts == [primary_model, fallback_model]
 
 
 def test_max_tool_rounds_nudges_final_answer(client, monkeypatch):

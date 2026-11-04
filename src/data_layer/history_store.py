@@ -1,20 +1,33 @@
-"""SQLite dataset and forecast persistence for the onion Chronos-2 MVP.
+"""MongoDB dataset and forecast persistence for the onion Chronos-2 MVP.
 
-The legacy daily observation store uses:
-- prices: INR per metric quintal (₹/metric quintal)
-- arrivals: metric quintals per observation/day
-- production and consumption: metric quintals/day
+This is the MongoDB architecture port of the former SQLite store. Each former
+table is now a collection that keeps the SAME field names, so all pandas and
+API behaviour is unchanged:
 
-Graph-specific tables store daily price/arrival observations in model units and AP
+- `observations`            : full legacy daily observation store (prices INR/metric quintal,
+                              arrivals metric quintals/day, quantities metric quintals/day)
+- `daily_price_observations`: daily graph 1/2 model input (model units)
+- `ap_monthly_observations` : monthly AP production/consumption/arrivals (tonnes/month)
+- `forecast_runs` + `forecast_values` : persisted predictions (prices in INR/kg)
+- `ingestion_log`           : audit rows for every sync
+- `source_sync_state` / `graph_dataset_sync_state` : source-file mtime markers
+
+Graph-specific collections store daily price/arrival observations in model units and AP
 monthly production, consumption, and arrivals in tonnes/month. Forecast prices are
 persisted separately in INR/kg.
+
+Document `_id` mirrors the former SQL primary keys:
+  observations/daily_price_observations -> date ISO string
+  ap_monthly_observations               -> month_start ISO string
+  chat_sessions/chat forecasts keyed explicitly
+Integer sequences (forecast run ids, audit ids, chat message seq) come from the
+`counters` collection (atomic $inc), mirroring SQLite AUTOINCREMENT.
 """
 from __future__ import annotations
 
 import json
 import math
 import os
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +36,9 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+
+from db_client import (COUNTER_IDS, SCHEMA_VERSION, ensure_indexes, get_db,
+                       next_sequence, store_label)
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / "config" / ".env")
@@ -64,6 +80,8 @@ def _resolve_path(env_name: str, fallback: Path) -> Path:
 CSV_PATH = _resolve_path("ONION_DATA_PATH", DEFAULT_CSV)
 DAILY_PRICE_CSV_PATH = _resolve_path("ONION_DAILY_PRICE_DATA_PATH", DEFAULT_DAILY_PRICE_CSV)
 AP_MONTHLY_CSV_PATH = _resolve_path("ONION_AP_MONTHLY_DATA_PATH", DEFAULT_AP_MONTHLY_CSV)
+# Kept for compatibility: points at the retained SQLite backup used by
+# scripts/verify_migration.py; the live store is MongoDB (see store_label()).
 DB_PATH = _resolve_path("ONION_DB_PATH", ROOT / "data" / "onion_forecasting_v4.sqlite3")
 
 DAILY_GRAPH_COLUMNS = [
@@ -74,6 +92,9 @@ DAILY_GRAPH_COLUMNS = [
 MONTHLY_GRAPH_COLUMNS = [
     "month_start", "production_t_month", "consumption_t_month", "arrival_t_month",
 ]
+
+TOLERANCE = 1e-6
+DATE_TIME_FORMAT = "%Y-%m-%d"
 
 
 @dataclass
@@ -91,61 +112,23 @@ class SyncResult:
                 "latest_observation_date": self.latest_observation_date}
 
 
-def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+@dataclass
+class DashUpsertResult:
+    source: str
+    rows_seen: int
+    inserted: int
+    updated: int
+    unchanged: int
+    gap_filled: int = 0
+    correction_count: int = 0
+    latest_observation_date: str | None = None
+    corrections: list[dict[str, Any]] = field(default_factory=list)
 
-
-def _create_schema(conn: sqlite3.Connection) -> None:
-    existing = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='observations'").fetchone()
-    if existing:
-        cols = {r[1] for r in conn.execute('PRAGMA table_info("observations")').fetchall()}
-        if not set(EXPECTED_COLUMNS).issubset(cols):
-            legacy_name = "observations_legacy_previous"
-            legacy_exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (legacy_name,)).fetchone()
-            if not legacy_exists:
-                conn.execute(f'ALTER TABLE observations RENAME TO "{legacy_name}"')
-            else:
-                conn.execute("DROP TABLE observations")
-    cols_sql = ['"timestamp" TEXT PRIMARY KEY', '"item_id" TEXT NOT NULL',
-                *[f'"{c}" REAL NOT NULL' for c in NUMERIC_COLUMNS],
-                '"source" TEXT NOT NULL', '"ingested_at" TEXT NOT NULL']
-    conn.execute(f"CREATE TABLE IF NOT EXISTS observations ({', '.join(cols_sql)})")
-    conn.execute("""CREATE TABLE IF NOT EXISTS ingestion_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, checked_at TEXT NOT NULL, source TEXT NOT NULL,
-        status TEXT NOT NULL, rows_seen INTEGER NOT NULL DEFAULT 0, inserted INTEGER NOT NULL DEFAULT 0,
-        updated INTEGER NOT NULL DEFAULT 0, unchanged INTEGER NOT NULL DEFAULT 0,
-        latest_observation_date TEXT, message TEXT)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS source_sync_state (
-        source_path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, synced_at TEXT NOT NULL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS forecast_runs (
-        run_id INTEGER PRIMARY KEY AUTOINCREMENT, graph_code TEXT NOT NULL, generated_at TEXT NOT NULL,
-        model_id TEXT NOT NULL, horizon_days INTEGER NOT NULL, last_observation_date TEXT NOT NULL,
-        context_hash TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}')""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_forecast_runs_graph_latest ON forecast_runs(graph_code, generated_at DESC)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS forecast_values (
-        run_id INTEGER NOT NULL, state_code TEXT NOT NULL, target_key TEXT NOT NULL,
-        forecast_date TEXT NOT NULL, p10 REAL NOT NULL, p50 REAL NOT NULL, p90 REAL NOT NULL,
-        unit TEXT NOT NULL, PRIMARY KEY (run_id,state_code,target_key,forecast_date),
-        FOREIGN KEY (run_id) REFERENCES forecast_runs(run_id) ON DELETE CASCADE)""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_forecast_values_latest ON forecast_values(state_code,target_key,forecast_date)")
-    daily_value_columns = ", ".join(
-        f'"{column}" REAL NOT NULL' for column in DAILY_GRAPH_COLUMNS[2:])
-    conn.execute(
-        f'CREATE TABLE IF NOT EXISTS daily_price_observations ('
-        f'"timestamp" TEXT PRIMARY KEY, "item_id" TEXT NOT NULL, {daily_value_columns})'
-    )
-    conn.execute("""CREATE TABLE IF NOT EXISTS ap_monthly_observations (
-        month_start TEXT PRIMARY KEY, production_t_month REAL NOT NULL,
-        consumption_t_month REAL NOT NULL, arrival_t_month REAL NOT NULL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS graph_dataset_sync_state (
-        dataset_key TEXT PRIMARY KEY, source_path TEXT NOT NULL, source_mtime_ns INTEGER NOT NULL,
-        source_size INTEGER NOT NULL, synced_at TEXT NOT NULL)""")
+    def as_dict(self) -> dict[str, Any]:
+        return {"source": self.source, "rows_seen": self.rows_seen, "inserted": self.inserted,
+                "updated": self.updated, "unchanged": self.unchanged, "gap_filled": self.gap_filled,
+                "corrections": self.correction_count,
+                "latest_observation_date": self.latest_observation_date}
 
 
 def _canonicalize_source_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -272,47 +255,65 @@ def normalize_ap_monthly_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return _validate_graph_frame(out[MONTHLY_GRAPH_COLUMNS], "month_start", "MS")
 
 
-def _sync_graph_dataset(dataset_key: str, path: Path, table: str, frame: pd.DataFrame,
+# ---------------------------------------------------------------------------
+# MongoDB graph-dataset sync (mtime-tracked upsert, replaces _sync_graph_dataset)
+# ---------------------------------------------------------------------------
+
+def _sync_graph_dataset(dataset_key: str, path: Path, collection: str, frame: pd.DataFrame,
                         date_column: str) -> None:
     stat = path.stat()
     resolved = str(path.resolve())
-    with connect() as conn:
-        _create_schema(conn)
-        state = conn.execute(
-            "SELECT source_path,source_mtime_ns,source_size FROM graph_dataset_sync_state WHERE dataset_key=?",
-            (dataset_key,),
-        ).fetchone()
-        if (state is not None and state["source_path"] == resolved
-                and int(state["source_mtime_ns"]) == int(stat.st_mtime_ns)
-                and int(state["source_size"]) == int(stat.st_size)):
-            return
+    db = get_db()
+    ensure_indexes(db)
+    state = db.graph_dataset_sync_state.find_one({"dataset_key": dataset_key})
+    if (state is not None
+            and state.get("source_path") == resolved
+            and int(state.get("source_mtime_ns", -1)) == int(stat.st_mtime_ns)
+            and int(state.get("source_size", -1)) == int(stat.st_size)):
+        return
 
-        columns = list(frame.columns)
-        quoted_columns = ",".join(f'"{column}"' for column in columns)
-        placeholders = ",".join("?" for _ in columns)
-        updates = ",".join(
-            f'"{column}"=excluded."{column}"'
-            for column in columns if column != date_column
-        )
-        records = []
-        for row in frame.itertuples(index=False, name=None):
-            values = list(row)
-            date_index = columns.index(date_column)
-            values[date_index] = pd.Timestamp(values[date_index]).strftime("%Y-%m-%d")
-            records.append(tuple(values))
-        conn.executemany(
-            f'INSERT INTO "{table}" ({quoted_columns}) VALUES ({placeholders}) '
-            f'ON CONFLICT("{date_column}") DO UPDATE SET {updates}',
-            records,
-        )
-        conn.execute("""INSERT INTO graph_dataset_sync_state
-            (dataset_key,source_path,source_mtime_ns,source_size,synced_at) VALUES(?,?,?,?,?)
-            ON CONFLICT(dataset_key) DO UPDATE SET source_path=excluded.source_path,
-            source_mtime_ns=excluded.source_mtime_ns,source_size=excluded.source_size,
-            synced_at=excluded.synced_at""",
-            (dataset_key, resolved, int(stat.st_mtime_ns), int(stat.st_size),
-             datetime.now(timezone.utc).isoformat(timespec="seconds")),
-        )
+    records = []
+    for row in frame.itertuples(index=False, name=None):
+        values = dict(zip(frame.columns, row))
+        stamp = pd.Timestamp(values[date_column]).strftime(DATE_TIME_FORMAT)
+        values[date_column] = stamp
+        # BSON only encodes native Python types; pandas int64 columns would raise
+        # InvalidDocument. Every numeric column is validated float-able above.
+        plain = {}
+        for key, value in values.items():
+            if key in (date_column, "item_id", "timestamp"):
+                plain[key] = str(value)
+            else:
+                plain[key] = float(value)
+        plain["version"] = SCHEMA_VERSION
+        records.append({"_id": stamp, **plain})
+    if records:
+        upserts = []
+        for record in records:
+            plain = {k: v for k, v in record.items() if k != "_id"}
+            upserts.append(({"_id": record["_id"]}, plain))
+        for doc_id, plain in upserts:
+            db[collection].replace_one(doc_id, plain, upsert=True)
+    db.graph_dataset_sync_state.update_one(
+        {"dataset_key": dataset_key},
+        {"$set": {
+            "dataset_key": dataset_key,
+            "source_path": resolved,
+            "source_mtime_ns": int(stat.st_mtime_ns),
+            "source_size": int(stat.st_size),
+            "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }},
+        upsert=True,
+    )
+
+
+def _collection_rows(db, collection: str, columns: list[str], date_column: str) -> pd.DataFrame:
+    cursor = db[collection].find(
+        {},
+        {column: 1 for column in columns} | {"_id": 0},
+        sort=[(date_column, 1)],
+    )
+    return pd.DataFrame(list(cursor), columns=columns)
 
 
 def load_daily_price_history() -> pd.DataFrame:
@@ -322,18 +323,14 @@ def load_daily_price_history() -> pd.DataFrame:
         pd.read_csv(DAILY_PRICE_CSV_PATH, encoding="utf-8-sig"))
     _sync_graph_dataset("daily_prices", DAILY_PRICE_CSV_PATH,
                         "daily_price_observations", frame, "timestamp")
-    with connect() as conn:
-        quoted_columns = ",".join(f'"{column}"' for column in DAILY_GRAPH_COLUMNS)
-        stored = pd.read_sql_query(
-            f'SELECT {quoted_columns} FROM daily_price_observations ORDER BY timestamp',
-            conn,
-        )
+    db = get_db()
+    stored = _collection_rows(db, "daily_price_observations", DAILY_GRAPH_COLUMNS, "timestamp")
     stored["timestamp"] = pd.to_datetime(stored["timestamp"])
     return stored
 
 
 def sync_daily_price_csv_from_graph(dates: Iterable[str]) -> dict[str, int]:
-    """Persist selected SQLite daily graph rows back to the configured source CSV."""
+    """Persist selected MongoDB daily graph rows back to the configured source CSV."""
     stamps = sorted({str(stamp) for stamp in dates})
     result = {"rows_appended": 0, "values_updated": 0}
     if not stamps:
@@ -351,12 +348,8 @@ def sync_daily_price_csv_from_graph(dates: Iterable[str]) -> dict[str, int]:
         raise ValueError("Daily price dataset contains invalid or duplicate dates.")
     normalize_daily_price_frame(source)
 
-    with connect() as conn:
-        quoted_columns = ",".join(f'"{column}"' for column in DAILY_GRAPH_COLUMNS)
-        graph = pd.read_sql_query(
-            f'SELECT {quoted_columns} FROM daily_price_observations ORDER BY timestamp',
-            conn,
-        )
+    db = get_db()
+    graph = _collection_rows(db, "daily_price_observations", DAILY_GRAPH_COLUMNS, "timestamp")
     graph["timestamp"] = pd.to_datetime(graph["timestamp"]).dt.normalize()
     graph_by_date = {
         row["timestamp"].strftime("%Y-%m-%d"): row
@@ -400,7 +393,7 @@ def sync_daily_price_csv_from_graph(dates: Iterable[str]) -> dict[str, int]:
     for stamp in stamps:
         graph_row = graph_by_date.get(stamp)
         if graph_row is None:
-            raise ValueError(f"SQLite daily graph history is missing {stamp}.")
+            raise ValueError(f"MongoDB daily graph history is missing {stamp}.")
 
         index = source_index.get(stamp)
         if index is None:
@@ -454,24 +447,18 @@ def load_ap_monthly_history() -> pd.DataFrame:
         pd.read_csv(AP_MONTHLY_CSV_PATH, encoding="utf-8-sig"))
     _sync_graph_dataset("ap_monthly", AP_MONTHLY_CSV_PATH,
                         "ap_monthly_observations", frame, "month_start")
-    with connect() as conn:
-        quoted_columns = ",".join(f'"{column}"' for column in MONTHLY_GRAPH_COLUMNS)
-        stored = pd.read_sql_query(
-            f'SELECT {quoted_columns} FROM ap_monthly_observations ORDER BY month_start',
-            conn,
-        )
+    db = get_db()
+    stored = _collection_rows(db, "ap_monthly_observations", MONTHLY_GRAPH_COLUMNS, "month_start")
     stored["month_start"] = pd.to_datetime(stored["month_start"])
     return stored
 
 
 def ensure_graph_datasets_ready() -> None:
-    """Import the configured graph datasets when their SQLite tables are empty."""
-    with connect() as conn:
-        _create_schema(conn)
-        daily_count = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM daily_price_observations").fetchone()["n"])
-        monthly_count = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM ap_monthly_observations").fetchone()["n"])
+    """Import the configured graph datasets when their MongoDB collections are empty."""
+    db = get_db()
+    ensure_indexes(db)
+    daily_count = int(db["daily_price_observations"].count_documents({}))
+    monthly_count = int(db["ap_monthly_observations"].count_documents({}))
     if daily_count == 0:
         load_daily_price_history()
     if monthly_count == 0:
@@ -539,94 +526,108 @@ def normalize_source_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _log_sync(conn: sqlite3.Connection, result: SyncResult, status: str = "success", message: str | None = None) -> None:
+# ---------------------------------------------------------------------------
+# Ingestion audit log
+# ---------------------------------------------------------------------------
+
+def _log_sync(result: SyncResult, status: str = "success", message: str | None = None) -> dict[str, Any]:
+    """Insert one audit row with a sequential id (SQLite AUTOINCREMENT parity)."""
+    db = get_db()
     checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    conn.execute("""INSERT INTO ingestion_log
-        (checked_at,source,status,rows_seen,inserted,updated,unchanged,latest_observation_date,message)
-        VALUES (?,?,?,?,?,?,?,?,?)""", (checked, result.source, status, result.rows_seen, result.inserted,
-        result.updated, result.unchanged, result.latest_observation_date, message))
+    doc = {
+        "id": next_sequence(db, COUNTER_IDS["ingestion_log"]),
+        "checked_at": checked,
+        "source": result.source,
+        "status": status,
+        "rows_seen": int(result.rows_seen),
+        "inserted": int(result.inserted),
+        "updated": int(result.updated),
+        "unchanged": int(result.unchanged),
+        "latest_observation_date": result.latest_observation_date,
+        "message": message,
+        "version": SCHEMA_VERSION,
+    }
+    db.ingestion_log.insert_one(doc)
+    return doc
 
 
 def upsert_frame(frame: pd.DataFrame, source: str = "model_ready_csv") -> SyncResult:
     out = normalize_source_frame(frame)
     inserted = updated = unchanged = 0
     ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    insert_columns = ["timestamp", "item_id", *NUMERIC_COLUMNS, "source", "ingested_at"]
-    placeholders = ",".join("?" for _ in insert_columns)
-    update_cols = ["item_id", *NUMERIC_COLUMNS, "source", "ingested_at"]
-    update_sql = ",".join(f'"{c}"=excluded."{c}"' for c in update_cols)
-    quoted_insert = ",".join(f'"{c}"' for c in insert_columns)
-    compare_cols = ["item_id", *NUMERIC_COLUMNS]
-    quoted_compare = ",".join(f'"{c}"' for c in compare_cols)
-    sql = f'INSERT INTO observations ({quoted_insert}) VALUES ({placeholders}) ON CONFLICT(timestamp) DO UPDATE SET {update_sql}'
-    with connect() as conn:
-        _create_schema(conn)
-        try:
-            for _, row in out.iterrows():
-                stamp = row["timestamp"].strftime("%Y-%m-%d")
-                values = (stamp, str(row["item_id"]), *[float(row[c]) for c in NUMERIC_COLUMNS], source, ingested_at)
-                existing = conn.execute(f'SELECT {quoted_compare} FROM observations WHERE timestamp=?', (stamp,)).fetchone()
-                if existing is None:
-                    inserted += 1
-                    conn.execute(sql, values)
-                else:
-                    new_cmp = values[1:2 + len(NUMERIC_COLUMNS)]
-                    old_cmp = tuple(existing[c] for c in compare_cols)
-                    if new_cmp[0] == old_cmp[0] and all(abs(float(a)-float(b)) < 1e-9 for a,b in zip(new_cmp[1:], old_cmp[1:])):
-                        unchanged += 1
-                    else:
-                        updated += 1
-                        conn.execute(sql, values)
-            latest = out["timestamp"].max().strftime("%Y-%m-%d") if not out.empty else None
-            result = SyncResult(source, len(out), inserted, updated, unchanged, latest)
-            _log_sync(conn, result)
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            failed = SyncResult(source, len(out), inserted, updated, unchanged,
-                                out["timestamp"].max().strftime("%Y-%m-%d") if not out.empty else None)
-            _log_sync(conn, failed, status="error", message=str(exc))
-            conn.commit()
-            raise
+    stamps = [row["timestamp"].strftime(DATE_TIME_FORMAT) for _, row in out.iterrows()]
+    stamp_set = list(dict.fromkeys(stamps))
+
+    db = get_db()
+    ensure_indexes(db)
+    existing_rows = {doc["timestamp"]: doc for doc in
+                     db.observations.find({"timestamp": {"$in": stamp_set}})}
+
+    operations = []
+    for _, row in out.iterrows():
+        stamp = row["timestamp"].strftime(DATE_TIME_FORMAT)
+        document = {
+            "_id": stamp,
+            "timestamp": stamp,
+            "item_id": str(row["item_id"]),
+            **{column: float(row[column]) for column in NUMERIC_COLUMNS},
+            "source": source,
+            "ingested_at": ingested_at,
+            "version": SCHEMA_VERSION,
+        }
+        existing = existing_rows.get(stamp)
+        if existing is None:
+            inserted += 1
+        else:
+            same = (
+                document["item_id"] == str(existing.get("item_id", ""))
+                and all(abs(float(document[c]) - float(existing.get(c, float("nan")))) < 1e-9
+                        for c in NUMERIC_COLUMNS)
+            )
+            if same:
+                unchanged += 1
+            else:
+                updated += 1
+        operations.append(
+            ({"_id": stamp},
+             {k: v for k, v in document.items() if k != "_id"},
+             stamp in existing_rows)
+        )
+
+    # Replace semantics: full-row upsert keyed on the date (matches ON CONFLICT DO UPDATE).
+    from pymongo.collection import ReplaceOne
+
+    bulk = [
+        ReplaceOne(filter, plain, upsert=True)
+        for filter, plain, _existing in operations
+    ]
+    latest = out["timestamp"].max().strftime(DATE_TIME_FORMAT) if not out.empty else None
+    result = SyncResult(source, len(out), inserted, updated, unchanged, latest)
+    try:
+        if bulk:
+            db.observations.bulk_write(bulk, ordered=False)
+        _log_sync(result)
+    except Exception as exc:
+        failed = SyncResult(source, len(out), inserted, updated, unchanged,
+                            out["timestamp"].max().strftime(DATE_TIME_FORMAT) if not out.empty else None)
+        _log_sync(failed, status="error", message=str(exc))
+        raise
     return result
 
 
-TOLERANCE = 1e-6
-
-
-@dataclass
-class DashUpsertResult:
-    source: str
-    rows_seen: int
-    inserted: int
-    updated: int
-    unchanged: int
-    gap_filled: int = 0
-    correction_count: int = 0
-    latest_observation_date: str | None = None
-    corrections: list[dict[str, Any]] = field(default_factory=list)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"source": self.source, "rows_seen": self.rows_seen, "inserted": self.inserted,
-                "updated": self.updated, "unchanged": self.unchanged, "gap_filled": self.gap_filled,
-                "corrections": self.correction_count,
-                "latest_observation_date": self.latest_observation_date}
-
-
 def latest_observation_date() -> str | None:
-    with connect() as conn:
-        _create_schema(conn)
-        row = conn.execute("SELECT MAX(timestamp) AS latest, COUNT(*) AS n FROM observations").fetchone()
-    if row is None or int(row["n"]) == 0:
-        return None
-    return str(row["latest"])
+    db = get_db()
+    ensure_indexes(db)
+    doc = db.observations.find_one({}, {"_id": 0, "timestamp": 1}, sort=[("timestamp", -1)])
+    return str(doc["timestamp"]) if doc else None
 
 
 def existing_dates_between(from_iso: str, to_iso: str) -> set[str]:
-    with connect() as conn:
-        _create_schema(conn)
-        rows = conn.execute("SELECT timestamp FROM observations WHERE timestamp >= ? AND timestamp <= ?",
-                            (from_iso, to_iso)).fetchall()
+    db = get_db()
+    rows = db.observations.find(
+        {"timestamp": {"$gte": from_iso, "$lte": to_iso}},
+        {"_id": 0, "timestamp": 1},
+    )
     return {str(r["timestamp"]) for r in rows}
 
 
@@ -635,7 +636,7 @@ def _validate_dash_updates(series_updates: dict[str, dict[str, float]]) -> None:
         raise ValueError("series_updates must be a dict of date -> {column: value}.")
     for stamp, columns in series_updates.items():
         try:
-            datetime.strptime(str(stamp), "%Y-%m-%d")
+            datetime.strptime(str(stamp), DATE_TIME_FORMAT)
         except ValueError as exc:
             raise ValueError(f"Invalid observation date {stamp!r}; expected YYYY-MM-DD: {exc}") from exc
         unknown = [c for c in columns if c not in NUMERIC_COLUMNS]
@@ -651,7 +652,7 @@ def upsert_dash_graph_observations(
         series_updates: dict[str, dict[str, float]],
         gap_dates: Iterable[str] | None = None,
         update_existing: bool = True) -> dict[str, Any]:
-    """Mirror fetched Dash values into graph tables using their canonical units.
+    """Mirror fetched Dash values into graph collections using their canonical units.
 
     Daily graph rows are completed by carrying forward the preceding row. AP
     monthly arrival totals are refreshed from daily quintals converted to tonnes;
@@ -679,122 +680,97 @@ def upsert_dash_graph_observations(
 
     monthly_arrival_column = QUANTITY_COLUMNS["AP"]["arrival"]
     affected_months: set[str] = set()
-    insert_columns = ["timestamp", "item_id", *DAILY_GRAPH_COLUMNS[2:]]
-    insert_sql = (
-        f'INSERT INTO "daily_price_observations" '
-        f'({", ".join(chr(34) + column + chr(34) for column in insert_columns)}) '
-        f'VALUES ({", ".join("?" for _ in insert_columns)})'
-    )
 
-    with connect() as conn:
-        _create_schema(conn)
-        try:
-            for stamp in requested_dates:
-                sourced = series_updates.get(stamp, {})
-                if monthly_arrival_column in sourced:
-                    month = datetime.strptime(stamp, "%Y-%m-%d").replace(day=1)
-                    affected_months.add(month.strftime("%Y-%m-%d"))
+    db = get_db()
+    ensure_indexes(db)
+    daily = db["daily_price_observations"]
 
-                existing = conn.execute(
-                    'SELECT * FROM "daily_price_observations" WHERE "timestamp"=?',
-                    (stamp,),
-                ).fetchone()
-                if existing is not None:
-                    changes: dict[str, float] = {}
-                    for column, raw_value in sourced.items():
-                        value = float(raw_value)
-                        old_value = float(existing[column])
-                        if abs(value - old_value) <= TOLERANCE:
-                            result["values_unchanged"] += 1
-                        elif update_existing:
-                            changes[column] = value
-                            result["values_updated"] += 1
-                    if changes:
-                        set_sql = ", ".join(f'"{column}"=?' for column in changes)
-                        conn.execute(
-                            f'UPDATE "daily_price_observations" SET {set_sql} WHERE "timestamp"=?',
-                            [*changes.values(), stamp],
-                        )
-                    continue
+    def _get(stamp: str) -> dict | None:
+        return daily.find_one({"_id": stamp})
 
-                previous = conn.execute(
-                    'SELECT * FROM "daily_price_observations" WHERE "timestamp"<? '
-                    'ORDER BY "timestamp" DESC LIMIT 1',
-                    (stamp,),
-                ).fetchone()
-                if previous is None:
-                    raise ValueError(
-                        "daily_price_observations has no earlier row to carry forward; "
-                        "load the configured daily dataset before ingestion."
-                    )
+    def _insert(stamp: str, item_id: str, values: dict[str, float]) -> None:
+        doc = {"_id": stamp, "timestamp": stamp, "item_id": item_id,
+               **{column: float(value) for column, value in values.items()},
+               "version": SCHEMA_VERSION}
+        daily.insert_one(doc)
 
-                previous_date = datetime.strptime(str(previous["timestamp"]), "%Y-%m-%d").date()
-                target_date = datetime.strptime(stamp, "%Y-%m-%d").date()
-                next_date = previous_date + timedelta(days=1)
-                while next_date <= target_date:
-                    day = next_date.strftime("%Y-%m-%d")
-                    day_existing = conn.execute(
-                        'SELECT * FROM "daily_price_observations" WHERE "timestamp"=?',
-                        (day,),
-                    ).fetchone()
-                    if day_existing is not None:
-                        previous = day_existing
-                    else:
-                        values = {column: previous[column] for column in insert_columns
-                                  if column not in ("timestamp", "item_id")}
-                        day_values = series_updates.get(day, {})
-                        values.update({column: float(value) for column, value in day_values.items()})
-                        conn.execute(insert_sql, [
-                            day,
-                            str(previous["item_id"]),
-                            *[values[column] for column in insert_columns[2:]],
-                        ])
-                        result["rows_inserted"] += 1
-                        if day_values:
-                            result["values_updated"] += len(day_values)
-                        else:
-                            result["gap_rows_filled"] += 1
-                        previous = conn.execute(
-                            'SELECT * FROM "daily_price_observations" WHERE "timestamp"=?',
-                            (day,),
-                        ).fetchone()
-                    next_date += timedelta(days=1)
+    for stamp in requested_dates:
+        sourced = series_updates.get(stamp, {})
+        if monthly_arrival_column in sourced:
+            month = datetime.strptime(stamp, DATE_TIME_FORMAT).replace(day=1)
+            affected_months.add(month.strftime(DATE_TIME_FORMAT))
 
-            for month_start in sorted(affected_months):
-                month_date = datetime.strptime(month_start, "%Y-%m-%d")
-                next_month = (month_date.replace(day=28) + timedelta(days=4)).replace(day=1)
-                monthly_row = conn.execute(
-                    'SELECT arrival_t_month FROM "ap_monthly_observations" WHERE month_start=?',
-                    (month_start,),
-                ).fetchone()
-                if monthly_row is None:
-                    result["monthly_arrival_months_missing"].append(month_start)
-                    continue
-                arrival_quintals = conn.execute(
-                    'SELECT COALESCE(SUM("AP_arrival_metric_quintal"), 0) AS total '
-                    'FROM "daily_price_observations" WHERE "timestamp">=? AND "timestamp"<?',
-                    (month_start, next_month.strftime("%Y-%m-%d")),
-                ).fetchone()["total"]
-                arrival_tonnes = float(arrival_quintals) / 10.0
-                if abs(arrival_tonnes - float(monthly_row["arrival_t_month"])) > TOLERANCE:
-                    conn.execute(
-                        'UPDATE "ap_monthly_observations" SET arrival_t_month=? WHERE month_start=?',
-                        (arrival_tonnes, month_start),
-                    )
-                    result["monthly_arrivals_updated"] += 1
+        existing = _get(stamp)
+        if existing is not None:
+            changes: dict[str, float] = {}
+            for column, raw_value in sourced.items():
+                value = float(raw_value)
+                old_value = float(existing[column])
+                if abs(value - old_value) <= TOLERANCE:
+                    result["values_unchanged"] += 1
+                elif update_existing:
+                    changes[column] = value
+                    result["values_updated"] += 1
+            if changes:
+                daily.update_one({"_id": stamp}, {"$set": changes})
+            continue
 
-            latest = conn.execute(
-                'SELECT MAX("timestamp") AS latest FROM "daily_price_observations"').fetchone()["latest"]
-            result["latest_observation_date"] = str(latest) if latest else None
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+        previous = daily.find_one({"timestamp": {"$lt": stamp}}, sort=[("timestamp", -1)])
+        if previous is None:
+            raise ValueError(
+                "daily_price_observations has no earlier row to carry forward; "
+                "load the configured daily dataset before ingestion."
+            )
+
+        previous_date = datetime.strptime(str(previous["timestamp"]), DATE_TIME_FORMAT).date()
+        target_date = datetime.strptime(stamp, DATE_TIME_FORMAT).date()
+        next_date = previous_date + timedelta(days=1)
+        while next_date <= target_date:
+            day = next_date.strftime(DATE_TIME_FORMAT)
+            day_existing = _get(day)
+            if day_existing is not None:
+                previous = day_existing
+            else:
+                values = {column: previous[column] for column in DAILY_GRAPH_COLUMNS
+                          if column not in ("timestamp", "item_id")}
+                day_values = series_updates.get(day, {})
+                values.update({column: float(value) for column, value in day_values.items()})
+                _insert(day, str(previous["item_id"]), values)
+                result["rows_inserted"] += 1
+                if day_values:
+                    result["values_updated"] += len(day_values)
+                else:
+                    result["gap_rows_filled"] += 1
+                previous = _get(day)
+            next_date += timedelta(days=1)
+
+    # AP monthly arrival refresh uses a Mongo aggregation (SUM of daily quintals).
+    monthly = db["ap_monthly_observations"]
+    for month_start in sorted(affected_months):
+        month_date = datetime.strptime(month_start, DATE_TIME_FORMAT)
+        next_month = (month_date.replace(day=28) + timedelta(days=4)).replace(day=1)
+        monthly_row = monthly.find_one({"_id": month_start})
+        if monthly_row is None:
+            result["monthly_arrival_months_missing"].append(month_start)
+            continue
+        agg = list(db["daily_price_observations"].aggregate([
+            {"$match": {"timestamp": {"$gte": month_start, "$lt": next_month.strftime(DATE_TIME_FORMAT)}}},
+            {"$group": {"_id": None, "total": {"$sum": f"${monthly_arrival_column}"}}},
+        ]))
+        arrival_quintals = float(agg[0]["total"]) if agg else 0.0
+        arrival_tonnes = arrival_quintals / 10.0
+        if abs(arrival_tonnes - float(monthly_row["arrival_t_month"])) > TOLERANCE:
+            monthly.update_one({"_id": month_start},
+                               {"$set": {"arrival_t_month": arrival_tonnes}})
+            result["monthly_arrivals_updated"] += 1
+
+    latest_doc = daily.find_one({}, {"timestamp": 1}, sort=[("timestamp", -1)])
+    result["latest_observation_date"] = str(latest_doc["timestamp"]) if latest_doc else None
     return result
 
 
 def classify_dash_updates(series_updates: dict[str, dict[str, float]]) -> dict[str, Any]:
-    """Read-only classification of (date, column) values against the current DB.
+    """Read-only classification of (date, column) values against the current store.
 
     Returns missing_dates (rows that would be inserted), corrections (existing
     values that differ beyond TOLERANCE; never applied here) and unchanged count.
@@ -804,21 +780,24 @@ def classify_dash_updates(series_updates: dict[str, dict[str, float]]) -> dict[s
     corrections: list[dict[str, Any]] = []
     unchanged = 0
     missing_dates: list[str] = []
-    with connect() as conn:
-        _create_schema(conn)
-        for stamp in sorted(series_updates):
-            row = conn.execute('SELECT * FROM "observations" WHERE "timestamp"=?', (stamp,)).fetchone()
-            if row is None:
-                missing_dates.append(stamp)
-                continue
-            for column in sorted(series_updates[stamp]):
-                new_value = float(series_updates[stamp][column])
-                old_value = float(row[column])
-                if abs(new_value - old_value) <= TOLERANCE:
-                    unchanged += 1
-                else:
-                    corrections.append({"date": stamp, "column": column,
-                                        "old_value": old_value, "new_value": new_value, "applied": False})
+    db = get_db()
+    ensure_indexes(db)
+    stamps = sorted(series_updates)
+    docs = {doc["timestamp"]: doc for doc in
+            db.observations.find({"timestamp": {"$in": stamps}})}
+    for stamp in stamps:
+        row = docs.get(stamp)
+        if row is None:
+            missing_dates.append(stamp)
+            continue
+        for column in sorted(series_updates[stamp]):
+            new_value = float(series_updates[stamp][column])
+            old_value = float(row[column])
+            if abs(new_value - old_value) <= TOLERANCE:
+                unchanged += 1
+            else:
+                corrections.append({"date": stamp, "column": column,
+                                    "old_value": old_value, "new_value": new_value, "applied": False})
     return {"missing_dates": missing_dates, "corrections": corrections, "unchanged": unchanged}
 
 
@@ -833,7 +812,7 @@ def upsert_dash_observations(series_updates: dict[str, dict[str, float]],
     - For each date in series_updates with sourced values (ascending order):
       * date absent -> INSERT a complete row: sourced values + every not-sourced
         column forward-filled from the previous row (mirrors the "Interpolated"
-        dataset convention). All 24 columns are REAL NOT NULL.
+        dataset convention). All 24 columns are stored as finite floats.
       * date present -> compare per column: <= TOLERANCE -> unchanged; differs ->
         correction: update ONLY that column (source/source_correction) and record
         before/after; skipped when update_existing is False (logged, not applied).
@@ -841,88 +820,83 @@ def upsert_dash_observations(series_updates: dict[str, dict[str, float]],
       row (source/source_gapfill) so the daily index never gets a gap.
 
     The caller is responsible for writing the ingestion_log audit row
-    (see record_sync); this function only performs observation-table writes.
+    (see record_sync); this function only performs observation-collection writes.
     """
     _validate_dash_updates(series_updates)
     rows_seen = sum(len(columns) for columns in series_updates.values())
     corrections: list[dict[str, Any]] = []
     inserted = updated = unchanged = gap_filled = 0
     ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    insert_columns = ["timestamp", "item_id", *NUMERIC_COLUMNS, "source", "ingested_at"]
-    insert_sql = (
-        f'INSERT INTO "observations" ({", ".join(chr(34) + c + chr(34) for c in insert_columns)}) '
-        f'VALUES ({", ".join("?" for _ in insert_columns)})'
-    )
 
-    with connect() as conn:
-        _create_schema(conn)
-        try:
-            current = conn.execute('SELECT * FROM "observations" ORDER BY "timestamp" DESC LIMIT 1').fetchone()
-            if current is None:
-                raise ValueError(
-                    "SQLite history is empty; import the model-ready CSV first with sync_model_ready_csv.py."
-                )
-            last_stamp = str(current["timestamp"])
-            last_item_id = str(current["item_id"])
-            last_values = {c: float(current[c]) for c in NUMERIC_COLUMNS}
+    db = get_db()
+    ensure_indexes(db)
+    observations = db.observations
 
-            def refresh_last() -> None:
-                nonlocal last_stamp, last_values, last_item_id
-                row = conn.execute('SELECT * FROM "observations" ORDER BY "timestamp" DESC LIMIT 1').fetchone()
-                if row is not None:
-                    last_stamp = str(row["timestamp"])
-                    last_values = {c: float(row[c]) for c in NUMERIC_COLUMNS}
-                    last_item_id = str(row["item_id"])
+    current = observations.find_one({}, sort=[("timestamp", -1)])
+    if current is None:
+        raise ValueError(
+            "MongoDB history is empty; import the model-ready CSV first with sync_model_ready_csv.py."
+        )
+    last_stamp = str(current["timestamp"])
+    last_item_id = str(current["item_id"])
+    last_values = {c: float(current[c]) for c in NUMERIC_COLUMNS}
 
-            for stamp in sorted(set(series_updates) | set(gap_dates or [])):
-                sourced = series_updates.get(stamp)
-                existing = conn.execute('SELECT * FROM "observations" WHERE "timestamp"=?', (stamp,)).fetchone()
-                if existing is None:
-                    row_values = {c: last_values[c] for c in NUMERIC_COLUMNS}
-                    if sourced:
-                        row_values.update({c: float(v) for c, v in sourced.items()})
-                        inserted += len(sourced)
-                        label = source
+    def refresh_last() -> None:
+        nonlocal last_stamp, last_values, last_item_id
+        row = observations.find_one({}, sort=[("timestamp", -1)])
+        if row is not None:
+            last_stamp = str(row["timestamp"])
+            last_values = {c: float(row[c]) for c in NUMERIC_COLUMNS}
+            last_item_id = str(row["item_id"])
+
+    try:
+        for stamp in sorted(set(series_updates) | set(gap_dates or [])):
+            sourced = series_updates.get(stamp)
+            existing = observations.find_one({"_id": stamp})
+            if existing is None:
+                row_values = {c: last_values[c] for c in NUMERIC_COLUMNS}
+                if sourced:
+                    row_values.update({c: float(v) for c, v in sourced.items()})
+                    inserted += len(sourced)
+                    label = source
+                else:
+                    gap_filled += 1
+                    label = source_gapfill
+                document = {"_id": stamp, "timestamp": stamp, "item_id": last_item_id,
+                            **row_values, "source": label, "ingested_at": ingested_at,
+                            "version": SCHEMA_VERSION}
+                observations.insert_one(document)
+                if stamp > last_stamp:
+                    refresh_last()
+            elif sourced:
+                changes: dict[str, float] = {}
+                edits = sorted(sourced)
+                for column in edits:
+                    new_value = float(sourced[column])
+                    old_value = float(existing[column])
+                    if abs(new_value - old_value) <= TOLERANCE:
+                        unchanged += 1
+                    elif update_existing:
+                        changes[column] = new_value
+                        updated += 1
+                        corrections.append({"date": stamp, "column": column, "old_value": old_value,
+                                            "new_value": new_value, "applied": True})
                     else:
-                        gap_filled += 1
-                        label = source_gapfill
-                    conn.execute(insert_sql, [stamp, last_item_id, *[row_values[c] for c in NUMERIC_COLUMNS],
-                                              label, ingested_at])
-                    if stamp > last_stamp:
+                        corrections.append({"date": stamp, "column": column, "old_value": old_value,
+                                            "new_value": new_value, "applied": False})
+                        unchanged += 1
+                if changes:
+                    set_doc = {**{c: v for c, v in changes.items()},
+                               "source": source_correction, "ingested_at": ingested_at}
+                    observations.update_one({"_id": stamp}, {"$set": set_doc})
+                    if stamp >= last_stamp:
                         refresh_last()
-                elif sourced:
-                    changes: dict[str, float] = {}
-                    edits = sorted(sourced)
-                    for column in edits:
-                        new_value = float(sourced[column])
-                        old_value = float(existing[column])
-                        if abs(new_value - old_value) <= TOLERANCE:
-                            unchanged += 1
-                        elif update_existing:
-                            changes[column] = new_value
-                            updated += 1
-                            corrections.append({"date": stamp, "column": column, "old_value": old_value,
-                                                "new_value": new_value, "applied": True})
-                        else:
-                            corrections.append({"date": stamp, "column": column, "old_value": old_value,
-                                                "new_value": new_value, "applied": False})
-                            unchanged += 1
-                    if changes:
-                        set_sql = ", ".join(f'"{c}"=?' for c in changes)
-                        conn.execute(
-                            f'UPDATE "observations" SET {set_sql}, "source"=?, "ingested_at"=? WHERE "timestamp"=?',
-                            [*changes.values(), source_correction, ingested_at, stamp],
-                        )
-                        if stamp >= last_stamp:
-                            refresh_last()
-            latest = conn.execute('SELECT MAX("timestamp") AS m FROM "observations"').fetchone()["m"]
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            failed = SyncResult(source, rows_seen, inserted, updated, unchanged, None)
-            _log_sync(conn, failed, status="error", message=str(exc))
-            conn.commit()
-            raise
+        latest_doc = observations.find_one({}, {"timestamp": 1}, sort=[("timestamp", -1)])
+        latest = latest_doc["timestamp"] if latest_doc else None
+    except Exception as exc:
+        failed = SyncResult(source, rows_seen, inserted, updated, unchanged, None)
+        _log_sync(failed, status="error", message=str(exc))
+        raise
     return DashUpsertResult(source=source, rows_seen=rows_seen, inserted=inserted, updated=updated,
                             unchanged=unchanged, gap_filled=gap_filled, correction_count=len(corrections),
                             latest_observation_date=str(latest) if latest else None,
@@ -932,20 +906,20 @@ def upsert_dash_observations(series_updates: dict[str, dict[str, float]],
 def record_sync(source: str, status: str, rows_seen: int = 0, inserted: int = 0, updated: int = 0,
                 unchanged: int = 0, latest_observation: str | None = None, message: str | None = None) -> None:
     """Public audit-row helper for callers outside this module."""
-    with connect() as conn:
-        _create_schema(conn)
-        _log_sync(conn, SyncResult(source, rows_seen, inserted, updated, unchanged, latest_observation),
-                  status=status, message=message)
-        conn.commit()
+    _log_sync(SyncResult(source, rows_seen, inserted, updated, unchanged, latest_observation),
+              status=status, message=message)
 
 
 def _mark_source_synced(path: Path) -> None:
     stat = path.stat()
-    with connect() as conn:
-        _create_schema(conn)
-        conn.execute("""INSERT INTO source_sync_state(source_path,mtime_ns,synced_at) VALUES(?,?,?)
-            ON CONFLICT(source_path) DO UPDATE SET mtime_ns=excluded.mtime_ns,synced_at=excluded.synced_at""",
-            (str(path.resolve()), int(stat.st_mtime_ns), datetime.now(timezone.utc).isoformat(timespec="seconds")))
+    db = get_db()
+    db.source_sync_state.update_one(
+        {"source_path": str(path.resolve())},
+        {"$set": {"source_path": str(path.resolve()),
+                  "mtime_ns": int(stat.st_mtime_ns),
+                  "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}},
+        upsert=True,
+    )
 
 
 def sync_model_ready_csv(path: str | Path, source: str = "model_ready_csv") -> SyncResult:
@@ -962,78 +936,277 @@ def sync_model_ready_csv(path: str | Path, source: str = "model_ready_csv") -> S
 
 
 def ensure_store_ready() -> None:
-    with connect() as conn:
-        _create_schema(conn)
-        count = int(conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"])
-        state = conn.execute("SELECT mtime_ns FROM source_sync_state WHERE source_path=?", (str(CSV_PATH.resolve()),)).fetchone()
+    db = get_db()
+    ensure_indexes(db)
+    count = int(db.observations.count_documents({}))
+    state = db.source_sync_state.find_one({"source_path": str(CSV_PATH.resolve())})
     if not CSV_PATH.exists():
         if count == 0:
             raise FileNotFoundError(f"No history rows and seed CSV missing at {CSV_PATH}.")
         return
     csv_mtime = CSV_PATH.stat().st_mtime_ns
-    if count == 0 or state is None or int(state["mtime_ns"]) != int(csv_mtime):
+    if count == 0 or state is None or int(state.get("mtime_ns", -1)) != int(csv_mtime):
         result = sync_model_ready_csv(CSV_PATH, source="initial_csv_seed" if count == 0 else "configured_csv_refresh")
-        print(f"Synchronized configured dataset into SQLite: {result.as_dict()}")
+        print(f"Synchronized configured dataset into MongoDB: {result.as_dict()}")
 
 
 def load_history() -> pd.DataFrame:
     ensure_store_ready()
-    quoted = ",".join(f'"{c}"' for c in EXPECTED_COLUMNS)
-    with connect() as conn:
-        frame = pd.read_sql_query(f"SELECT {quoted} FROM observations ORDER BY timestamp", conn)
+    db = get_db()
+    projection = {column: 1 for column in EXPECTED_COLUMNS} | {"_id": 0}
+    docs = list(db.observations.find({}, projection, sort=[("timestamp", 1)]))
+    frame = pd.DataFrame(docs, columns=EXPECTED_COLUMNS)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"])
     for state in STATE_CODES:
         frame[SUPPLY_COLUMNS[state]] = frame[QUANTITY_COLUMNS[state]["arrival"]] + frame[QUANTITY_COLUMNS[state]["production"]]
     return frame
 
 
+# ---------------------------------------------------------------------------
+# Forecast persistence
+# ---------------------------------------------------------------------------
+
 def save_forecast_run(graph_code: str, horizon_days: int, last_observation_date: str, context_hash: str,
                       forecast_values: Iterable[dict[str, Any]], model_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     values = list(forecast_values)
-    with connect() as conn:
-        _create_schema(conn)
-        cur = conn.execute("""INSERT INTO forecast_runs(graph_code,generated_at,model_id,horizon_days,last_observation_date,context_hash,metadata_json)
-            VALUES(?,?,?,?,?,?,?)""", (graph_code, generated_at, model_id, int(horizon_days), last_observation_date,
-            context_hash, json.dumps(metadata or {}, ensure_ascii=False, default=str)))
-        run_id = int(cur.lastrowid)
-        conn.executemany("""INSERT INTO forecast_values(run_id,state_code,target_key,forecast_date,p10,p50,p90,unit)
-            VALUES(?,?,?,?,?,?,?,?)""", [(run_id, str(v["state_code"]), str(v["target_key"]), str(v["forecast_date"]),
-            float(v["p10"]), float(v["p50"]), float(v["p90"]), str(v["unit"])) for v in values])
-        conn.commit()
-    return {"run_id": run_id, "generated_at": generated_at, "saved_values": len(values), "graph_code": graph_code}
+    db = get_db()
+    ensure_indexes(db)
+    run_id = next_sequence(db, COUNTER_IDS["forecast_runs"])
+    try:
+        db.forecast_runs.insert_one({
+            "_id": str(run_id),
+            "run_id": int(run_id),
+            "graph_code": graph_code,
+            "generated_at": generated_at,
+            "model_id": model_id,
+            "horizon_days": int(horizon_days),
+            "last_observation_date": last_observation_date,
+            "context_hash": context_hash,
+            "metadata_json": json.dumps(metadata or {}, ensure_ascii=False, default=str),
+            "engine": "mongodb",
+            "version": SCHEMA_VERSION,
+        })
+        if values:
+            db.forecast_values.insert_many([
+                {"run_id": int(run_id), "state_code": str(v["state_code"]),
+                 "target_key": str(v["target_key"]), "forecast_date": str(v["forecast_date"]),
+                 "p10": float(v["p10"]), "p50": float(v["p50"]), "p90": float(v["p90"]),
+                 "unit": str(v["unit"]), "version": SCHEMA_VERSION}
+                for v in values
+            ])
+    except Exception:
+        # Remove a partially-written run so retries never leave orphan docs.
+        db.forecast_values.delete_many({"run_id": run_id})
+        db.forecast_runs.delete_one({"run_id": int(run_id)})
+        raise
+    return {"run_id": int(run_id), "generated_at": generated_at, "saved_values": len(values), "graph_code": graph_code}
 
 
 def get_latest_forecast(graph_code: str | None = None) -> dict[str, Any] | None:
     ensure_store_ready()
-    with connect() as conn:
-        if graph_code:
-            row = conn.execute("SELECT * FROM forecast_runs WHERE graph_code=? ORDER BY generated_at DESC,run_id DESC LIMIT 1", (graph_code,)).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM forecast_runs ORDER BY generated_at DESC,run_id DESC LIMIT 1").fetchone()
-        if row is None:
-            return None
-        values = conn.execute("SELECT state_code,target_key,forecast_date,p10,p50,p90,unit FROM forecast_values WHERE run_id=? ORDER BY state_code,target_key,forecast_date", (row["run_id"],)).fetchall()
-    result = dict(row)
-    result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
-    result["forecast_values"] = [dict(v) for v in values]
+    db = get_db()
+    match = {"graph_code": graph_code} if graph_code else {}
+    row = db.forecast_runs.find_one(match, sort=[("generated_at", -1), ("run_id", -1)])
+    if row is None:
+        return None
+    values = list(db.forecast_values.find(
+        {"run_id": int(row["run_id"])},
+        {"_id": 0, "run_id": 0},
+        sort=[("state_code", 1), ("target_key", 1), ("forecast_date", 1)],
+    ))
+    result = {key: row[key] for key in row if key not in ("_id", "metadata_json")}
+    result["metadata"] = json.loads(row.get("metadata_json") or "{}")
+    result["forecast_values"] = values
     return result
 
 
 def list_forecast_runs(limit: int = 20) -> list[dict[str, Any]]:
     ensure_store_ready()
-    with connect() as conn:
-        rows = conn.execute("SELECT run_id,graph_code,generated_at,model_id,horizon_days,last_observation_date,context_hash FROM forecast_runs ORDER BY generated_at DESC,run_id DESC LIMIT ?", (max(1,min(int(limit),100)),)).fetchall()
-    return [dict(r) for r in rows]
+    db = get_db()
+    projection = {"_id": 0, "run_id": 1, "graph_code": 1, "generated_at": 1, "model_id": 1,
+                  "horizon_days": 1, "last_observation_date": 1, "context_hash": 1}
+    cursor = db.forecast_runs.find({}, projection,
+                                   sort=[("generated_at", -1), ("run_id", -1)],
+                                   limit=max(1, min(int(limit), 100)))
+    return list(cursor)
 
 
 def ingestion_status() -> dict[str, Any]:
     ensure_store_ready()
-    with connect() as conn:
-        latest_log = conn.execute("SELECT * FROM ingestion_log ORDER BY id DESC LIMIT 1").fetchone()
-        count = conn.execute("SELECT COUNT(*) AS n FROM observations").fetchone()["n"]
-        dates = conn.execute("SELECT MIN(timestamp) AS first_date,MAX(timestamp) AS last_date FROM observations").fetchone()
-        runs = conn.execute("SELECT COUNT(*) AS n FROM forecast_runs").fetchone()["n"]
-    return {"database_path": str(DB_PATH), "observation_rows": int(count),
-            "first_observation_date": dates["first_date"], "last_observation_date": dates["last_date"],
-            "forecast_run_count": int(runs), "last_ingestion": dict(latest_log) if latest_log else None}
+    db = get_db()
+    latest_log = db.ingestion_log.find_one({}, sort=[("id", -1)])
+    count = int(db.observations.count_documents({}))
+    first_date = db.observations.find_one({}, {"timestamp": 1}, sort=[("timestamp", 1)])
+    last_date = db.observations.find_one({}, {"timestamp": 1}, sort=[("timestamp", -1)])
+    runs = int(db.forecast_runs.count_documents({}))
+    return {"database_path": store_label(),
+            "observation_rows": count,
+            "first_observation_date": first_date.get("timestamp") if first_date else None,
+            "last_observation_date": last_date.get("timestamp") if last_date else None,
+            "forecast_run_count": runs,
+            "last_ingestion": {k: v for k, v in latest_log.items() if k != "_id"} if latest_log else None,
+            "store_engine": "mongodb"}
+
+
+def ingestion_audit(limit_days: int = 7) -> list[dict[str, Any]]:
+    """Aggregation audit: inserted/updated/unchanged sums per source over the
+    last N days (MongoDB $group pipeline replacing the SQL audit queries)."""
+    db = get_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(limit_days)))) \
+        .isoformat(timespec="seconds")
+    pipeline = [
+        {"$match": {"checked_at": {"$gte": cutoff}}},
+        {"$group": {"_id": "$source",
+                    "runs": {"$sum": 1},
+                    "total_rows_seen": {"$sum": "$rows_seen"},
+                    "total_inserted": {"$sum": "$inserted"},
+                    "total_updated": {"$sum": "$updated"},
+                    "total_unchanged": {"$sum": "$unchanged"},
+                    "last_checked_at": {"$max": "$checked_at"},
+                    "statuses": {"$addToSet": "$status"}}},
+        {"$project": {"_id": 0, "source": "$_id", "runs": 1, "total_rows_seen": 1,
+                      "total_inserted": 1, "total_updated": 1, "total_unchanged": 1,
+                      "last_checked_at": 1, "statuses": 1}},
+        {"$sort": {"last_checked_at": -1}},
+    ]
+    return list(db.ingestion_log.aggregate(pipeline))
+
+
+def supply_balance_snapshot() -> list[dict[str, Any]]:
+    """Aggregation pipeline computing AP monthly shortfall =
+    consumption - (arrival + production) directly in MongoDB ($addFields)."""
+    db = get_db()
+    pipeline = [
+        {"$addFields": {"shortfall_t_month": {
+            "$subtract": ["$consumption_t_month",
+                          {"$add": ["$arrival_t_month", "$production_t_month"]}]}}},
+        {"$project": {"_id": 0, "month_start": 1, "production_t_month": 1,
+                      "consumption_t_month": 1, "arrival_t_month": 1,
+                      "shortfall_t_month": 1}},
+        {"$sort": {"month_start": 1}},
+    ]
+    return list(db["ap_monthly_observations"].aggregate(pipeline))
+
+
+# ---------------------------------------------------------------------------
+# Additional aggregation-pipeline helpers (read-only analytics; the store keeps
+# wide documents — one date row with per-state columns — so some of the long-form
+# pipeline shapes from the migration plan are expressed against the wide schema)
+# ---------------------------------------------------------------------------
+
+def latest_series_snapshot(collection: str = "observations",
+                           date_field: str = "timestamp") -> list[dict[str, Any]]:
+    """Aggregation #1 (latest observation per series): $sort desc -> $group by
+    series id -> $first value per series. On this wide schema the 'series'
+    key is item_id (one aligned row per date covers every state column)."""
+    db = get_db()
+    sample = db[collection].find_one({}, {"_id": 0})
+    group_id: Any = "$item_id" if (sample and "item_id" in sample) else None
+    pipeline = [
+        {"$sort": {date_field: -1}},
+        {"$group": {"_id": group_id, "latest": {"$first": f"${date_field}"}}},
+        {"$project": {"_id": 0, "item_id": "$_id", "latest": 1}},
+        {"$sort": {"latest": -1}},
+    ]
+    return list(db[collection].aggregate(pipeline))
+
+
+def price_rollups(unit: str = "week",
+                  collection: str = "daily_price_observations",
+                  columns: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    """Aggregation #2 (time rollup): avg per calendar week/month over the daily
+    graph collection, executed with $dateTrunc when the server supports it
+    (>= 5.0; timestamps are ISO strings, so $dateFromString first). Falls back
+    to in-Python bucketing on older servers so behavior is version-independent."""
+    db = get_db()
+    numeric = (list(columns) if columns
+               else [c for c in DAILY_GRAPH_COLUMNS if c not in ("item_id", "timestamp")])
+    pipeline: list[dict[str, Any]] = [
+        {"$addFields": {"_bdate": {"$dateFromString": {"dateString": "$timestamp"}}}},
+        {"$group": {
+            "_id": {"$dateTrunc": {"date": "$_bdate", "unit": unit,
+                                   "startOfWeek": "monday"}},
+            "count": {"$sum": 1},
+            **{column: {"$avg": f"${column}"} for column in numeric},
+        }},
+        {"$project": {"_id": 0,
+                      "bucket": {"$dateToString": {"date": "$_id", "format": DATE_TIME_FORMAT}},
+                      "count": 1, **{c: 1 for c in numeric}}},
+        {"$sort": {"bucket": 1}},
+    ]
+    try:
+        return list(db[collection].aggregate(pipeline))
+    except Exception:
+        # Versions without $dateTrunc: mirror the grouping in Python.
+        docs = list(db[collection].find({}, {"timestamp": 1, **{c: 1 for c in numeric}, "_id": 0}))
+        buckets: dict[str, dict[str, Any]] = {}
+        for doc in docs:
+            stamp = pd.Timestamp(doc["timestamp"])
+            if unit == "week":
+                key = (stamp - pd.Timedelta(days=stamp.weekday())).strftime(DATE_TIME_FORMAT)
+            else:
+                key = stamp.strftime("%Y-%m-01")
+            slot = buckets.setdefault(key, {"bucket": key, "count": 0,
+                                            **{c: 0.0 for c in numeric}})
+            slot["count"] += 1
+            for column in numeric:
+                slot[column] += float(doc[column])
+        out = []
+        for key in sorted(buckets):
+            slot = buckets[key]
+            slot.update({c: slot[c] / slot["count"] for c in numeric if slot["count"]})
+            out.append(slot)
+        return out
+
+
+def forecast_with_values(graph_code: str | None = None, limit: int = 1) -> list[dict[str, Any]]:
+    """Aggregation #3 (forecast retrieval): latest forecast run(s) with their
+    values joined in one server-side $lookup — replaces the former two-step SQL
+    read for ad-hoc analytics views (get_latest_forecast keeps identical app
+    behaviour with the two-query form)."""
+    db = get_db()
+    ensure_indexes(db)
+    match = {"$match": {"graph_code": graph_code}} if graph_code else {"$match": {}}
+    pipeline = [
+        match,
+        {"$sort": {"generated_at": -1, "run_id": -1}},
+        {"$limit": max(1, min(int(limit), 20))},
+        {"$lookup": {"from": "forecast_values", "localField": "run_id",
+                     "foreignField": "run_id", "as": "values"}},
+        {"$project": {"_id": 0}},
+        {"$sort": {"generated_at": -1, "run_id": -1}},
+    ]
+    return list(db.forecast_runs.aggregate(pipeline))
+
+
+def price_change_snapshot(target_column: str,
+                          as_of: str | None = None) -> dict[str, Any] | None:
+    """Aggregation #6 (price change): newest observation of `target_column` and
+    the one before it, with the delta computed in Python (portable across all
+    MongoDB versions)."""
+    db = get_db()
+    query: dict[str, Any] = {target_column: {"$exists": True, "$ne": None}}
+    if as_of:
+        query["timestamp"] = {"$lte": as_of}
+    docs = list(db.observations.find(query, {"_id": 0},
+                                     sort=[("timestamp", -1)], limit=2))
+    if not docs:
+        return None
+    current = docs[0]
+    result: dict[str, Any] = {
+        "column": target_column,
+        "current_date": current["timestamp"],
+        "current_value": float(current[target_column]),
+    }
+    if len(docs) > 1:
+        previous = docs[1]
+        previous_value = float(previous[target_column])
+        change = result["current_value"] - previous_value
+        result.update({
+            "previous_date": previous["timestamp"],
+            "previous_value": previous_value,
+            "change": change,
+            "change_percent": (change / previous_value * 100.0) if previous_value else None,
+        })
+    return result

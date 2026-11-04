@@ -34,14 +34,39 @@ Window rule: every run requests **yesterday = today (Asia/Kolkata) − 1**; the 
 
 ```powershell
 # Latest 3 dataset rows + their source label
-.venv\Scripts\python.exe -c "import sqlite3; conn=sqlite3.connect('data/onion_forecasting_v4.sqlite3'); conn.row_factory=sqlite3.Row; [print(dict(r)) for r in conn.execute('SELECT timestamp, AP_retail_rs_per_metric_quintal, source FROM observations ORDER BY timestamp DESC LIMIT 3')]"
+.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'src/data_layer'); import history_store; [print(dict(d)) for d in history_store.get_db().observations.find({}, {'_id':0,'timestamp':1,'AP_retail_rs_per_metric_quintal':1,'source':1}, sort=[('timestamp',-1)], limit=3)]"
 
 # Last 3 audit entries (one row per run)
-.venv\Scripts\python.exe -c "import sqlite3; conn=sqlite3.connect('data/onion_forecasting_v4.sqlite3'); conn.row_factory=sqlite3.Row; [print(dict(r)) for r in conn.execute('SELECT checked_at, source, status, inserted, unchanged FROM ingestion_log ORDER BY id DESC LIMIT 3')]"
+.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'src/data_layer'); import history_store; [print(dict(d)) for d in history_store.get_db().ingestion_log.find({}, {'_id':0,'checked_at':1,'source':1,'status':1,'inserted':1,'unchanged':1}, sort=[('id',-1)], limit=3)]"
 
-# Full offline test suite (31 tests)
+# One-time: create MongoDB indexes + backfill version:1 on pre-migration docs
+.venv\Scripts\python.exe scripts\init_mongodb_indexes.py
+
+# One-time: rename plan-alias collections (daily_prices/monthly_balances/ingestion_logs)
+# to the canonical schema names if your dump used them
+.venv\Scripts\python.exe scripts\align_collection_names.py
+
+# One-time: compare retained SQLite backup with the MongoDB store
+.venv\Scripts\python.exe scripts\verify_migration.py
+
+# Full offline test suite (runs against the throwaway onion_forecasting_test MongoDB DB)
 .venv\Scripts\python.exe -m pytest -q
 ```
+
+## 4. MongoDB backup & monitoring
+
+```powershell
+# Full logical backup (install MongoDB Database Tools; one folder per date)
+mongodump --uri "<MONGO_URI from config\.env>" --db onion_forecasting --out data\backups\%DATE:~10,4%-%DATE:~4,2%-%DATE:~7,2%
+
+# Restore into the live DB (after a failure) — drop first to avoid duplicates
+mongorestore --uri "<MONGO_URI>" --db onion_forecasting --drop data\backups\<date>\onion_forecasting
+```
+
+- Enable **Atlas automated backups** (Continuous Backup / or scheduled snapshots on M0+: manual trigger via UI) as the primary recovery path; `mongodump` is the offline second copy.
+- Slow-query profiling for diagnostics (temporary, increases write overhead while on):
+  `mongosh "<MONGO_URI>" --eval "db.getSiblingDB('onion_forecasting').setProfilingLevel(1, { slowms: 250 })"`
+- The pre-migration SQLite file is retained at `data\onion_forecasting_v4.sqlite3` (plus `.bak` copy) until one week of stable MongoDB operation; only then archive/remove it.
 
 Other audit locations: `data\corrections_log.csv` (value corrections), `data\snapshots\`
 (raw responses, newest 30 kept), `data\pull_upag_dash.lock` (overlap guard — safe to

@@ -1,4 +1,7 @@
-"""API contract tests using a fake predictor; no model weights/network needed."""
+"""API contract tests using a fake predictor; no model weights/network needed.
+
+Store: MongoDB backend (test database `onion_forecasting_test`, recreated per test).
+"""
 from __future__ import annotations
 import os
 import sys
@@ -8,8 +11,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 from fastapi.testclient import TestClient
+import db_client
 import history_store
 import main
+
+
+TEST_DB_NAME = "onion_forecasting_test"
+
+
+def isolate_mongodb(monkeypatch) -> None:
+    """Point the store at a throwaway test database and purge it."""
+    monkeypatch.setenv("MONGO_DB_NAME", TEST_DB_NAME)
+    db_client.drop_database_collections(TEST_DB_NAME)
 
 
 class FixedDate(date):
@@ -35,7 +48,7 @@ class FakeChronosPipeline:
 
 
 def client_with_fake(monkeypatch, tmp_path):
-    monkeypatch.setattr(history_store, "DB_PATH", tmp_path / "test.sqlite3")
+    isolate_mongodb(monkeypatch)
     daily_path = tmp_path / "daily_prices.csv"
     daily_rows = []
     for day_index, stamp in enumerate(("2026-10-23", "2026-10-24", "2026-10-25")):
@@ -114,7 +127,12 @@ def test_api_cors_preflight_does_not_require_bearer_token(monkeypatch, tmp_path)
         },
     )
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    # The allow-origin echo depends on the deployment's CORS_ORIGINS config:
+    # a wildcard entry answers "*", explicit origins are echoed back verbatim.
+    configured = [x.strip() for x in os.getenv(
+        "CORS_ORIGINS", "*").split(",") if x.strip()]
+    expected = "*" if "*" in configured else "http://localhost:3000"
+    assert response.headers["access-control-allow-origin"] == expected
 
 
 def test_graph1_retail_uses_only_requested_context_and_converts_forecast(monkeypatch, tmp_path):
@@ -178,7 +196,7 @@ def test_graph1_confidence_score_is_present_bounded_and_monotone(monkeypatch, tm
         assert all(earlier >= later for earlier, later in zip(scores, scores[1:]))
 
 
-def test_new_graph_datasets_are_loaded_into_sqlite(monkeypatch, tmp_path):
+def test_new_graph_datasets_are_loaded_into_mongodb(monkeypatch, tmp_path):
     client_with_fake(monkeypatch, tmp_path)
 
     daily = history_store.load_daily_price_history()
@@ -192,9 +210,9 @@ def test_new_graph_datasets_are_loaded_into_sqlite(monkeypatch, tmp_path):
     assert monthly.iloc[-1]["month_start"].date().isoformat() == "2026-10-01"
     assert monthly.iloc[-1]["production_t_month"] == 54000
 
-    with history_store.connect() as conn:
-        daily_count = conn.execute("SELECT COUNT(*) FROM daily_price_observations").fetchone()[0]
-        monthly_count = conn.execute("SELECT COUNT(*) FROM ap_monthly_observations").fetchone()[0]
+    db = db_client.get_db(TEST_DB_NAME)
+    daily_count = db["daily_price_observations"].count_documents({})
+    monthly_count = db["ap_monthly_observations"].count_documents({})
     assert daily_count == 3
     assert monthly_count == 3
 
