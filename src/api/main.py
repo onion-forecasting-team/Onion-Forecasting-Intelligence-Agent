@@ -15,8 +15,9 @@ import json
 import logging
 import math
 import os
+import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -32,7 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src" / "
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 from history_store import (
     CSV_PATH, PRICE_COLUMNS, QUANTITY_COLUMNS,
-    STATE_CODES, STATE_NAMES, get_latest_forecast, ingestion_status, list_forecast_runs,
+    STATE_CODES, STATE_NAMES, get_latest_forecast, get_latest_run_meta,
+    ingestion_status, list_forecast_runs,
     load_ap_monthly_history, load_daily_price_history, save_forecast_run,
     sync_model_ready_csv,
 )
@@ -58,6 +60,25 @@ PRICE_TYPES = {"RETAIL": "retail",
                "WHOLESALE": "wholesale", "MANDI_MODAL": "mandi_modal"}
 PRICE_LABELS = {"retail": "Retail price",
                 "wholesale": "Wholesale price", "mandi_modal": "Mandi modal price"}
+
+MONTHLY_RETAIL_FEATURES = {
+    "wholesale": "wholesale_price_rs_kg",
+    "arrival": "arrival_t_month",
+    "mandi": "mandi_price_rs_kg",
+    "retail": "retail_price_rs_kg",
+    "production": "production_t_month",
+}
+
+# DB-first serving: Graph 1/2 responses are sliced from the latest precomputed
+# MongoDB run (a full-grid forecast of one horizon) instead of running Chronos-2
+# on every click. A background scheduler regenerates the grid every
+# PRECOMPUTE_REFRESH_DAYS days; the model runs on the request path only when no
+# fresh run covers the requested selection (fallback = on-demand inference).
+PRECOMPUTE_SCHEDULER_ENABLED = os.getenv("PRECOMPUTE_SCHEDULER_ENABLED", "1") != "0"
+PRECOMPUTE_HORIZON_DAYS = min(
+    max(1, int(os.getenv("PRECOMPUTE_HORIZON_DAYS", "180"))), MAX_FORECAST_HORIZON_DAYS)
+PRECOMPUTE_REFRESH_DAYS = max(1, int(os.getenv("PRECOMPUTE_REFRESH_DAYS", "5")))
+PRECOMPUTE_CHECK_INTERVAL_MIN = max(1, int(os.getenv("PRECOMPUTE_CHECK_INTERVAL_MIN", "15")))
 
 app = FastAPI(
     title="Onion Forecasting MVP API",
@@ -109,6 +130,19 @@ async def _prewarm_model_on_startup():
         )
     except Exception:
         logger.exception("Failed to pre-warm Chronos-2 pipeline; forecasts will be slower until first successful call.")
+    # Start the precomputed-forecast scheduler: regenerate the full-grid runs in
+    # MongoDB when the latest one is >= PRECOMPUTE_REFRESH_DAYS old (strict
+    # 5-day wall-clock cadence; data ingestion does not trigger reforecast).
+    global _refresh_thread
+    if PRECOMPUTE_SCHEDULER_ENABLED:
+        if _refresh_thread is not None and _refresh_thread.is_alive():
+            logger.info("Precomputed-forecast scheduler already running.")
+        else:
+            _refresh_thread = threading.Thread(
+                target=_precompute_scheduler_loop, name="precompute-refresh", daemon=True)
+            _refresh_thread.start()
+    else:
+        logger.info("Precomputed-forecast scheduler disabled (PRECOMPUTE_SCHEDULER_ENABLED=0).")
 
 
 @app.middleware("http")
@@ -409,6 +443,21 @@ def _confidence_score(q10: float, median: float, q90: float) -> float:
 
 
 def _price_forecast_records(data: pd.DataFrame, state: str, price_type: str, result: pd.DataFrame) -> list[dict]:
+    rows = [{"date": pd.Timestamp(row["timestamp"]).date().isoformat(),
+             "0.1": row["0.1"], "0.5": row["0.5"], "0.9": row["0.9"]}
+            for _, row in result.sort_values("timestamp").iterrows()]
+    return _price_records_from_quantile_rows(data, state, price_type, rows)
+
+
+def _price_records_from_quantile_rows(
+        data: pd.DataFrame, state: str, price_type: str, rows: list[dict]) -> list[dict]:
+    """Build price forecast records from quantile rows in INR/metric quintal units.
+
+    Each row is {"date": "YYYY-MM-DD", "0.1": q10, "0.5": q50, "0.9": q90}.
+    Shared by the on-demand inference path (Chronos-2 output rows) and the DB-first
+    serve path (quantiles previously persisted to MongoDB as INR/kg, restored to
+    metric-quintal model units before calling this builder).
+    """
     col = PRICE_COLUMNS[state][price_type]
     latest_row = data.loc[pd.to_datetime(data["timestamp"]).idxmax()]
     latest_actual_price_rs_kg = float(latest_row[col]) / 100.0
@@ -416,19 +465,25 @@ def _price_forecast_records(data: pd.DataFrame, state: str, price_type: str, res
 
     records: list[dict] = []
     running_min_confidence = float("inf")
-    for _, row in result.sort_values("timestamp").iterrows():
+    for row in rows:
         q10, q50, q90 = _quantile_values(row)
-        # Source and model units are INR/metric quintal. Convert ONLY forecast outputs to INR/kg.
-        p10, p50, p90 = q10 / 100.0, q50 / 100.0, q90 / 100.0
+        # Source and model units are INR/metric quintal. Convert ONLY forecast
+        # outputs to INR/kg, quantized to the persisted 4-decimal precision so the
+        # DB-first serve path (values restored from MongoDB at storage precision)
+        # and the on-demand inference path produce identical derived fields.
+        p10, p50, p90 = (round(value / 100.0, 4) for value in (q10, q50, q90))
         width = p90 - p10
         change_rs_kg = p50 - latest_actual_price_rs_kg
-        # Per-day confidence from the calibrated spread. The score is a cumulative
+        # Per-day confidence from the calibrated spread, computed on the same
+        # quantized values both paths contribute. The score is a cumulative
         # minimum across forecast dates (it may only stay level or decrease with
         # horizon), matching the pred["confidence_score"].cummin() post-process.
-        running_min_confidence = min(running_min_confidence, _confidence_score(q10, q50, q90))
+        running_min_confidence = min(
+            running_min_confidence,
+            _confidence_score(p10 * 100.0, p50 * 100.0, p90 * 100.0))
 
         records.append({
-            "date": pd.Timestamp(row["timestamp"]).date().isoformat(),
+            "date": row["date"],
             "state": state,
             "state_name": STATE_NAMES[state],
             "price_type": price_type,
@@ -512,6 +567,162 @@ def _persist_prices(graph_code: str, data: pd.DataFrame, horizon: int, records: 
                               "context_columns": context_cols, "quantiles": QUANTILES})
 
 
+# ---------------------------------------------------------------------------
+# Precomputed forecast service (DB-first serving + 5-day background refresh)
+# ---------------------------------------------------------------------------
+
+_PRECOMPUTE_GRAPH_SERIES = {
+    "graph1_ap_prices": ("AP",),
+    "graph2_state_comparison": tuple(STATE_CODES),
+}
+_refresh_lock = threading.Lock()
+_refresh_thread: threading.Thread | None = None
+
+
+def _precompute_series(graph_code: str) -> list[tuple[str, str]]:
+    """(state, price_type) pairs covered by one graph code's precomputed grid."""
+    return [(state, price_type)
+            for state in _PRECOMPUTE_GRAPH_SERIES.get(graph_code, ())
+            for price_type in PRICE_TYPES.values()]
+
+
+def _latest_run_is_fresh(graph_code: str) -> bool:
+    try:
+        meta = get_latest_run_meta(graph_code)
+    except Exception:
+        logger.exception("Could not read latest forecast run metadata for %s", graph_code)
+        return False
+    if meta is None:
+        return False
+    generated = pd.Timestamp(meta.get("generated_at"))
+    if pd.isna(generated):
+        return False
+    if generated.tzinfo is None:
+        generated = generated.tz_localize("UTC")
+    return pd.Timestamp.now(tz="UTC") - generated <= pd.Timedelta(days=PRECOMPUTE_REFRESH_DAYS)
+
+
+def _refresh_precomputed_run(graph_code: str, data: pd.DataFrame) -> dict:
+    """Forecast every series of one graph for the full horizon and persist the run.
+
+    Identical context across graphs (e.g. AP series shared by graph 1 and 2) is
+    deduplicated automatically by _PREDICTION_CACHE, so each series is inferred
+    once per shared context/horizon combination.
+    """
+    series = _precompute_series(graph_code)
+    rows: list[dict] = []
+    context_cols: list[str] = []
+    for state, price_type in series:
+        context_cols.extend(_price_context_columns(state, price_type))
+        result = _price_target_forecast(data, state, price_type, PRECOMPUTE_HORIZON_DAYS)
+        for _, row in result.sort_values("timestamp").iterrows():
+            q10, q50, q90 = _quantile_values(row)
+            rows.append({"state_code": state, "target_key": price_type,
+                         "forecast_date": pd.Timestamp(row["timestamp"]).date().isoformat(),
+                         "p10": round(q10 / 100.0, 4), "p50": round(q50 / 100.0, 4),
+                         "p90": round(q90 / 100.0, 4), "unit": "INR/kg"})
+    deduped_cols = list(dict.fromkeys(context_cols))
+    last_observation = pd.Timestamp(data["timestamp"].max()).date().isoformat()
+    saved = save_forecast_run(
+        graph_code, PRECOMPUTE_HORIZON_DAYS, last_observation,
+        _context_signature(data, deduped_cols), rows, MODEL_ID,
+        {"stored_forecast_price_unit": "INR/kg", "observation_price_unit": "INR/metric quintal",
+         "context_columns": deduped_cols, "quantiles": QUANTILES,
+         "refresh_source": "precompute_scheduler", "series_count": len(series)})
+    logger.info("Precomputed %s run %s saved (%d values)",
+                graph_code, saved["run_id"], saved["saved_values"])
+    return saved
+
+
+def _maybe_refresh_precomputed() -> dict[str, dict]:
+    """Refresh stale/missing precomputed runs; no-op while another refresh runs.
+
+    Called by the background scheduler loop (every PRECOMPUTE_CHECK_INTERVAL_MIN
+    minutes) and directly at startup. Runs are reused while younger than
+    PRECOMPUTE_REFRESH_DAYS regardless of request traffic.
+    """
+    refreshed: dict[str, dict] = {}
+    if not _refresh_lock.acquire(blocking=False):
+        return refreshed
+    try:
+        stale = [code for code in _PRECOMPUTE_GRAPH_SERIES if not _latest_run_is_fresh(code)]
+        if not stale:
+            return refreshed
+        data = get_data()
+        for graph_code in stale:
+            refreshed[graph_code] = _refresh_precomputed_run(graph_code, data)
+        return refreshed
+    finally:
+        _refresh_lock.release()
+
+
+def _precompute_scheduler_loop() -> None:
+    logger.info(
+        "Precomputed-forecast scheduler loop started (check every %d min, refresh every %d day(s))",
+        PRECOMPUTE_CHECK_INTERVAL_MIN, PRECOMPUTE_REFRESH_DAYS)
+    while True:
+        try:
+            refreshed = _maybe_refresh_precomputed()
+            for graph_code, run in refreshed.items():
+                logger.info("Background refresh completed for %s: run_id=%s",
+                            graph_code, run.get("run_id"))
+        except Exception:
+            logger.exception("Precomputed forecast refresh failed")
+        time.sleep(PRECOMPUTE_CHECK_INTERVAL_MIN * 60)
+
+
+def _serve_precomputed_forecast(
+        graph_code: str, data: pd.DataFrame, series: list[tuple[str, str]],
+        display_start: date, display_end: date) -> tuple[list[dict], dict] | None:
+    """Serve forecast rows by slicing the latest fresh MongoDB run.
+
+    Returns (records, served_run_meta) when the newest run is younger than
+    PRECOMPUTE_REFRESH_DAYS and fully covers every requested series/date, else
+    None so the caller falls back to on-demand Chronos-2 inference. Stored
+    values are already INR/kg; the shared record builder restores metric-quintal
+    model units (x100) so downstream math stays single-sourced.
+    """
+    try:
+        run = get_latest_forecast(graph_code)
+    except Exception:
+        logger.exception("Could not load precomputed run for %s", graph_code)
+        return None
+    if not run:
+        return None
+    generated = pd.Timestamp(run.get("generated_at"))
+    if pd.isna(generated):
+        return None
+    if generated.tzinfo is None:
+        generated = generated.tz_localize("UTC")
+    if pd.Timestamp.now(tz="UTC") - generated > pd.Timedelta(days=PRECOMPUTE_REFRESH_DAYS):
+        return None
+    values = run.get("forecast_values") or []
+    index: dict[tuple[str, str, str], tuple[float, float, float]] = {}
+    for value in values:
+        try:
+            index[(value["state_code"], value["target_key"], value["forecast_date"])] = (
+                float(value["p10"]), float(value["p50"]), float(value["p90"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    needed_dates = [stamp.date().isoformat()
+                    for stamp in pd.date_range(display_start, display_end, freq="D")]
+    records: list[dict] = []
+    for state, price_type in series:
+        quantile_rows: list[dict] = []
+        for iso_date in needed_dates:
+            stored = index.get((state, price_type, iso_date))
+            if stored is None:  # coverage miss → let the caller reforecast
+                return None
+            quantile_rows.append({"date": iso_date,
+                                  "0.1": stored[0] * 100.0,
+                                  "0.5": stored[1] * 100.0,
+                                  "0.9": stored[2] * 100.0})
+        records.extend(_price_records_from_quantile_rows(data, state, price_type, quantile_rows))
+    saved_meta = {"run_id": run["run_id"], "generated_at": run["generated_at"],
+                  "saved_values": len(values), "graph_code": graph_code}
+    return records, saved_meta
+
+
 def _status(data: pd.DataFrame, frequency: str = "daily") -> dict:
     last_date = pd.Timestamp(data["timestamp"].max()).date()
     stale = (date.today() - last_date).days
@@ -556,7 +767,8 @@ def root() -> dict:
     return {"service": "Onion Forecasting MVP API v3", "docs": "/docs",
             "graphs": {"graph_1_ap_prices": "/api/graphs/ap-retail",
                        "graph_2_state_comparison": "/api/graphs/state-comparison",
-                       "graph_3_supply_balance": "/api/graphs/supply-balance"},
+                       "graph_3_supply_balance": "/api/graphs/supply-balance",
+                       "graph_4_monthly_retail": "/api/graphs/monthly-retail"},
             "ops": {"health": "/health", "ingestion_status": "/api/ingestion/status", "saved_forecasts": "/api/forecasts/latest"}}
 
 
@@ -630,40 +842,51 @@ async def ap_retail_graph(
     forecast_limit_end = _forecast_limit_end_date(data, end_date)
     forecast_display_start = _forecast_display_start_date(data, start_date, forecast_limit_end)
     horizon_days = _date_range_horizon(data, start_date, end_date)
-    forecast: list[dict] = []
-    context_cols: list[str] = []
-    # Latency fix #3: parallel inference for multi-series using ThreadPoolExecutor.
-    # Each _price_target_forecast releases the GIL during torch inference, so
-    # concurrent threads run on the GPU in parallel.
-    def _forecast_for_type(price_type: str) -> tuple[list[str], list[dict]]:
-        cols = _price_context_columns("AP", price_type)
-        if horizon_days and forecast_display_start:
-            result = _price_target_forecast(data, "AP", price_type, horizon_days)
-            records = _filter_date_records(
-                _price_forecast_records(data, "AP", price_type, result),
-                forecast_display_start,
-                forecast_limit_end,
-            )
-        else:
-            records = []
-        return cols, records
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(selected) or 1)) as executor:
-        futures = [executor.submit(_forecast_for_type, pt) for pt in selected]
-        for future in concurrent.futures.as_completed(futures):
-            cols, records = future.result()
-            context_cols.extend(cols)
-            forecast.extend(records)
-    historical = []
+    historical: list[dict] = []
     for price_type in selected:
         historical.extend(_history_price_records(
             data, "AP", price_type, start_date, actual_end_date))
-    saved = (
-        _persist_prices("graph1_ap_prices", data, horizon_days, forecast, list(
-            dict.fromkeys(context_cols)))
-        if horizon_days and forecast_display_start
-        else None
-    )
+    forecast: list[dict] = []
+    context_cols: list[str] = []
+    series = [("AP", price_type) for price_type in selected]
+    served = None
+    if horizon_days and forecast_display_start:
+        served = _serve_precomputed_forecast(
+            "graph1_ap_prices", data, series,
+            forecast_display_start, forecast_limit_end)
+    if served is not None:
+        # DB-first path: slice the latest precomputed MongoDB run; no model call.
+        forecast, saved = served
+    else:
+        # Fallback: on-demand Chronos-2 inference (also persists this run).
+        # Latency fix #3: parallel inference for multi-series using ThreadPoolExecutor.
+        # Each _price_target_forecast releases the GIL during torch inference, so
+        # concurrent threads run on the GPU in parallel.
+        def _forecast_for_type(price_type: str) -> tuple[list[str], list[dict]]:
+            cols = _price_context_columns("AP", price_type)
+            if horizon_days and forecast_display_start:
+                result = _price_target_forecast(data, "AP", price_type, horizon_days)
+                records = _filter_date_records(
+                    _price_forecast_records(data, "AP", price_type, result),
+                    forecast_display_start,
+                    forecast_limit_end,
+                )
+            else:
+                records = []
+            return cols, records
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(selected) or 1)) as executor:
+            futures = [executor.submit(_forecast_for_type, pt) for pt in selected]
+            for future in concurrent.futures.as_completed(futures):
+                cols, records = future.result()
+                context_cols.extend(cols)
+                forecast.extend(records)
+        saved = (
+            _persist_prices("graph1_ap_prices", data, horizon_days, forecast, list(
+                dict.fromkeys(context_cols)))
+            if horizon_days and forecast_display_start
+            else None
+        )
     status = _status(data)
     forecast_warning = _forecast_limit_warning(end_date, forecast_limit_end)
     if forecast_warning:
@@ -715,40 +938,52 @@ async def state_comparison_graph(
     forecast: list[dict] = []
     historical: list[dict] = []
     context_cols: list[str] = []
-    # Latency fix #3 (continued): parallel multi-state/multi-price inference.
-    # Collect all (state, price_type, context_cols, records) in parallel, then build lists.
-    def _forecast_pair(args):
-        state, price_type = args
-        cols = _price_context_columns(state, price_type)
-        records = []
-        hist = []
-        if horizon_days and forecast_display_start:
-            result = _price_target_forecast(data, state, price_type, horizon_days)
-            records = _filter_date_records(
-                _price_forecast_records(data, state, price_type, result),
-                forecast_display_start, forecast_limit_end)
-        hist.extend(_history_price_records(data, state, price_type, start_date, actual_end_date))
-        return cols, records, hist
-
     pairs = [(s, p) for s in selected_states for p in selected_types]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pairs) or 1)) as executor:
-        results = list(executor.map(_forecast_pair, pairs))
-    for cols, records, hist in results:
-        context_cols.extend(cols)
-        forecast.extend(records)
-        historical.extend(hist)
+    served = None
+    if horizon_days and forecast_display_start:
+        served = _serve_precomputed_forecast(
+            "graph2_state_comparison", data, pairs,
+            forecast_display_start, forecast_limit_end)
+    if served is not None:
+        # DB-first path: slice the latest precomputed MongoDB run; no model call.
+        forecast, saved = served
+        for state, price_type in pairs:
+            historical.extend(_history_price_records(
+                data, state, price_type, start_date, actual_end_date))
+    else:
+        # Latency fix #3 (continued): parallel multi-state/multi-price inference.
+        # Collect all (state, price_type, context_cols, records) in parallel, then build lists.
+        def _forecast_pair(args):
+            state, price_type = args
+            cols = _price_context_columns(state, price_type)
+            records = []
+            hist = []
+            if horizon_days and forecast_display_start:
+                result = _price_target_forecast(data, state, price_type, horizon_days)
+                records = _filter_date_records(
+                    _price_forecast_records(data, state, price_type, result),
+                    forecast_display_start, forecast_limit_end)
+            hist.extend(_history_price_records(data, state, price_type, start_date, actual_end_date))
+            return cols, records, hist
 
-    saved = (
-        _persist_prices(
-            "graph2_state_comparison",
-            data,
-            horizon_days,
-            forecast,
-            list(dict.fromkeys(context_cols)),
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pairs) or 1)) as executor:
+            results = list(executor.map(_forecast_pair, pairs))
+        for cols, records, hist in results:
+            context_cols.extend(cols)
+            forecast.extend(records)
+            historical.extend(hist)
+
+        saved = (
+            _persist_prices(
+                "graph2_state_comparison",
+                data,
+                horizon_days,
+                forecast,
+                list(dict.fromkeys(context_cols)),
+            )
+            if horizon_days and forecast_display_start
+            else None
         )
-        if horizon_days and forecast_display_start
-        else None
-    )
     status = _status(data)
     forecast_warning = _forecast_limit_warning(end_date, forecast_limit_end)
     if forecast_warning:
@@ -943,6 +1178,318 @@ def supply_balance_graph(
                                             "note": "Overall confidence applies to Graph 1/2 daily price forecasts only; Graph 3 uses separate monthly component forecasts without per-day confidence."},
             "saved_to_sqlite": saved, **status,
             "forecast_end_date": max((r["date"] for r in forecast_rows), default=None)}
+
+
+@app.get("/api/graphs/monthly-retail")
+def monthly_retail_graph(
+    states: str = Query("AP"),
+    start_date: date = Query(...,
+                             description="First date to display, YYYY-MM-DD"),
+    end_date: date | None = Query(
+        None,
+        description=("Last date to display and forecast through, YYYY-MM-DD. "
+                     "Defaults to the maximum supported date after the latest monthly observation."),
+    ),
+    features: str = Query(
+        "wholesale,arrival,mandi,retail,production",
+        description="Comma-separated retail context features: wholesale, arrival, mandi, retail, production",
+    ),
+) -> dict:
+    data = get_monthly_data().rename(columns={"month_start": "timestamp"})
+    if end_date is None:
+        latest_observation = pd.Timestamp(data["timestamp"].max()).date()
+        end_date = latest_observation + timedelta(days=MAX_FORECAST_HORIZON_DAYS)
+    data["item_id"] = "AP_onion"
+    selected_states = _parse_list(states, set(STATE_CODES), "states")
+    if selected_states != ["AP"]:
+        raise HTTPException(
+            status_code=422,
+            detail="The monthly retail dataset currently contains Andhra Pradesh (AP) only.",
+        )
+
+    requested_features = [part.strip().lower() for part in features.split(",") if part.strip()]
+    if not requested_features:
+        requested_features = list(MONTHLY_RETAIL_FEATURES)
+    unknown = sorted(set(requested_features) - set(MONTHLY_RETAIL_FEATURES))
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported features: {unknown}. Allowed: {sorted(MONTHLY_RETAIL_FEATURES)}",
+        )
+    missing = [feature for feature in requested_features
+               if MONTHLY_RETAIL_FEATURES[feature] not in data.columns]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Monthly dataset is missing columns for features: {missing}",
+        )
+    selected_features = list(dict.fromkeys(requested_features))
+    covariate_features = [feature for feature in selected_features if feature != "retail"]
+    covariate_cols = [MONTHLY_RETAIL_FEATURES[feature] for feature in covariate_features]
+
+    forecast_limit_end = _forecast_limit_end_date(data, end_date)
+    horizon_days = _date_range_horizon(data, start_date, end_date)
+    latest_month = pd.Timestamp(data["timestamp"].max()).to_period("M")
+    limit_month = pd.Period(forecast_limit_end, freq="M")
+    horizon_months = max(0, limit_month.ordinal - latest_month.ordinal)
+
+    forecast_rows: list[dict] = []
+    historical: list[dict] = []
+    indexed: dict[str, dict[str, dict]] = {}
+    metric_forecasts: dict[str, list[tuple[str, float, float, float]]] = {}
+    db_values: list[dict] = []
+    timestamps = pd.to_datetime(data["timestamp"]).dt.date
+    history_mask = (timestamps >= start_date) & (timestamps <= end_date)
+    target_columns = {
+        "production": "production_t_month",
+        "consumption": "consumption_t_month",
+        "arrival": "arrival_t_month",
+    }
+
+    if horizon_months and start_date <= forecast_limit_end:
+        for metric, column in target_columns.items():
+            result = _run_target(data, column, horizon_months, freq="MS")
+            series: list[tuple[str, float, float, float]] = []
+            for _, row in result.sort_values("timestamp").iterrows():
+                month = pd.Timestamp(row["timestamp"]).date().isoformat()
+                if not (start_date.isoformat() <= month <= forecast_limit_end.isoformat()):
+                    continue
+                q10, q50, q90 = _quantile_values(row)
+                item = {
+                    "date": month,
+                    "state": "AP",
+                    "state_name": STATE_NAMES["AP"],
+                    "metric": metric,
+                    "predicted_quantity_tonnes_month": round(q50, 4),
+                    "p10_tonnes_month": round(q10, 4),
+                    "p50_tonnes_month": round(q50, 4),
+                    "p90_tonnes_month": round(q90, 4),
+                    "predicted_quantity_mq_day": round(q50, 4),
+                    "p10_mq_day": round(q10, 4),
+                    "p50_mq_day": round(q50, 4),
+                    "p90_mq_day": round(q90, 4),
+                    "unit": "tonnes/month",
+                }
+                forecast_rows.append(item)
+                indexed.setdefault(month, {})[metric] = item
+                series.append((month, q10, q50, q90))
+            metric_forecasts[metric] = series
+
+        future_covariate_frames: list[pd.DataFrame] = []
+        if "arrival" in covariate_features:
+            arrival_series = metric_forecasts.get("arrival", [])
+            if arrival_series:
+                future_covariate_frames.append(pd.DataFrame({
+                    "timestamp": [pd.Timestamp(item[0]) for item in arrival_series],
+                    "arrival_t_month": [item[2] for item in arrival_series],
+                }))
+        if "production" in covariate_features:
+            production_series = metric_forecasts.get("production", [])
+            if production_series:
+                future_covariate_frames.append(pd.DataFrame({
+                    "timestamp": [pd.Timestamp(item[0]) for item in production_series],
+                    "production_t_month": [item[2] for item in production_series],
+                }))
+        if "wholesale" in covariate_features:
+            result = _run_target(data, "wholesale_price_rs_kg", horizon_months, freq="MS")
+            future_covariate_frames.append(pd.DataFrame({
+                "timestamp": pd.to_datetime(result["timestamp"]),
+                "wholesale_price_rs_kg": result["0.5"].astype(float).values,
+            }))
+        if "mandi" in covariate_features:
+            result = _run_target(data, "mandi_price_rs_kg", horizon_months, freq="MS")
+            future_covariate_frames.append(pd.DataFrame({
+                "timestamp": pd.to_datetime(result["timestamp"]),
+                "mandi_price_rs_kg": result["0.5"].astype(float).values,
+            }))
+
+        future_covariates = None
+        if future_covariate_frames:
+            future_covariates = future_covariate_frames[0]
+            for frame in future_covariate_frames[1:]:
+                future_covariates = future_covariates.merge(
+                    frame, on="timestamp", how="left", validate="one_to_one")
+
+        price_forecast_rows: list[dict] = []
+        retail_col = "retail_price_rs_kg"
+        result = _run_target(
+            data, retail_col, horizon_months,
+            context_covariates=covariate_cols,
+            future_covariates=future_covariates,
+            freq="MS",
+        )
+        for _, row in result.sort_values("timestamp").iterrows():
+            month = pd.Timestamp(row["timestamp"]).date().isoformat()
+            if not (start_date.isoformat() <= month <= forecast_limit_end.isoformat()):
+                continue
+            q10, q50, q90 = _quantile_values(row)
+            price_forecast_rows.append({
+                "date": month,
+                "state": "AP",
+                "state_name": STATE_NAMES["AP"],
+                "metric": "retail",
+                "predicted_price_rs_kg": round(q50, 4),
+                "p10_rs_kg": round(q10, 4),
+                "p50_rs_kg": round(q50, 4),
+                "p90_rs_kg": round(q90, 4),
+                "unit": "INR/kg",
+            })
+    else:
+        price_forecast_rows = []
+
+    for metric, column in target_columns.items():
+        for row in data.loc[history_mask, ["timestamp", column]].itertuples(index=False):
+            quantity = round(float(getattr(row, column)), 4)
+            stamp = row.timestamp.date().isoformat() if hasattr(row.timestamp, "date") else str(row.timestamp)[:10]
+            historical.append({
+                "date": stamp,
+                "state": "AP",
+                "state_name": STATE_NAMES["AP"],
+                "metric": metric,
+                "actual_quantity_tonnes_month": quantity,
+                "actual_quantity_mq_day": quantity,
+                "unit": "tonnes/month",
+            })
+
+    if "retail_price_rs_kg" in data.columns:
+        for row in data.loc[history_mask, ["timestamp", "retail_price_rs_kg"]].itertuples(index=False):
+            stamp = row.timestamp.date().isoformat() if hasattr(row.timestamp, "date") else str(row.timestamp)[:10]
+            historical.append({
+                "date": stamp,
+                "state": "AP",
+                "state_name": STATE_NAMES["AP"],
+                "metric": "retail",
+                "actual_price_rs_kg": round(float(row.retail_price_rs_kg), 4),
+                "unit": "INR/kg",
+            })
+
+    balance: list[dict] = []
+    for month, vals in sorted(indexed.items()):
+        if not {"production", "consumption", "arrival"}.issubset(vals):
+            continue
+        production, consumption, arrival = (
+            vals["production"], vals["consumption"], vals["arrival"])
+        p10 = (consumption["p10_tonnes_month"] - arrival["p90_tonnes_month"]
+               - production["p90_tonnes_month"])
+        p50 = (consumption["predicted_quantity_tonnes_month"]
+               - arrival["predicted_quantity_tonnes_month"]
+               - production["predicted_quantity_tonnes_month"])
+        p90 = (consumption["p90_tonnes_month"] - arrival["p10_tonnes_month"]
+               - production["p10_tonnes_month"])
+        balance.append({
+            "date": month,
+            "state": "AP",
+            "state_name": STATE_NAMES["AP"],
+            "shortfall_p10_tonnes_month": round(p10, 4),
+            "shortfall_p50_tonnes_month": round(p50, 4),
+            "shortfall_p90_tonnes_month": round(p90, 4),
+            "shortfall_p10_metric_quintal_day": round(p10, 4),
+            "shortfall_p50_metric_quintal_day": round(p50, 4),
+            "shortfall_p90_metric_quintal_day": round(p90, 4),
+            "classification": "potential_shortfall" if p50 > 0 else (
+                "potential_surplus" if p50 < 0 else "near_balance"),
+        })
+
+    for row in forecast_rows:
+        db_values.append({
+            "state_code": row["state"], "target_key": row["metric"],
+            "forecast_date": row["date"], "p10": row["p10_tonnes_month"],
+            "p50": row["predicted_quantity_tonnes_month"],
+            "p90": row["p90_tonnes_month"], "unit": "tonnes/month",
+        })
+    for row in price_forecast_rows:
+        db_values.append({
+            "state_code": row["state"], "target_key": "retail",
+            "forecast_date": row["date"], "p10": row["p10_rs_kg"],
+            "p50": row["predicted_price_rs_kg"], "p90": row["p90_rs_kg"],
+            "unit": "INR/kg",
+        })
+    for row in balance:
+        db_values.append({
+            "state_code": row["state"], "target_key": "shortfall",
+            "forecast_date": row["date"], "p10": row["shortfall_p10_tonnes_month"],
+            "p50": row["shortfall_p50_tonnes_month"],
+            "p90": row["shortfall_p90_tonnes_month"], "unit": "tonnes/month",
+        })
+
+    context_cols = list(dict.fromkeys([*target_columns.values(), *covariate_cols]))
+    saved = (
+        save_forecast_run(
+            "graph4_monthly_retail",
+            horizon_days,
+            pd.Timestamp(data["timestamp"].max()).date().isoformat(),
+            _context_signature(data, context_cols),
+            db_values,
+            MODEL_ID,
+            {
+                "context_logic": {
+                    feature: MONTHLY_RETAIL_FEATURES[feature]
+                    for feature in selected_features
+                },
+                "selected_features": selected_features,
+                "balance_formula": "consumption - (arrival + production)",
+                "unit": "tonnes/month and INR/kg",
+                "forecast_frequency": "monthly",
+            },
+        )
+        if (forecast_rows or price_forecast_rows or balance) else None
+    )
+
+    warnings = [
+        "Shortfall = Consumption - (Arrival + Production). Positive values indicate potential shortfall; negative values indicate potential surplus.",
+    ]
+    forecast_warning = _forecast_limit_warning(end_date, forecast_limit_end)
+    if forecast_warning:
+        warnings.append(forecast_warning)
+    status = _status(data, frequency="monthly")
+    first_forecast_date = min(
+        (row["date"] for row in (forecast_rows + price_forecast_rows)), default=None)
+    status["forecast_start_date"] = first_forecast_date
+    status["warnings"] = warnings + status["warnings"]
+    metadata = {
+        **_metadata(),
+        "frequency": "monthly",
+        "quantity_unit": "tonnes/month",
+        "confidence_score": {
+            "available": False,
+            "reason": ("Monthly retail forecast uses selected context features; "
+                       "per-day confidence is not applied."),
+        },
+    }
+    return {
+        "graph": "monthly_retail_forecast",
+        "title": "Andhra Pradesh Monthly Supply and Retail Price Forecast",
+        "selected_states": selected_states,
+        "selected_state_names": [STATE_NAMES[x] for x in selected_states],
+        "horizon_days": horizon_days,
+        "quantity_unit": "tonnes/month",
+        "price_unit": "INR/kg",
+        "historical": historical,
+        "quantity_forecast": forecast_rows,
+        "balance_forecast": balance,
+        "price_forecast": price_forecast_rows,
+        "retail_forecast": price_forecast_rows,
+        "balance_formula": "consumption - (arrival + production)",
+        "selected_features": selected_features,
+        "context_features": selected_features,
+        "context_logic": {
+            feature: MONTHLY_RETAIL_FEATURES[feature]
+            for feature in selected_features
+        },
+        "warnings": warnings,
+        "metadata": metadata,
+        "requested_end_date": end_date.isoformat(),
+        "forecast_limit_date": forecast_limit_end.isoformat(),
+        "forecast_truncated": forecast_limit_end < end_date,
+        "forecast_overall_confidence": {
+            "available": False,
+            "note": "Overall confidence applies to Graph 1/2 daily price forecasts only.",
+        },
+        "saved_to_sqlite": saved,
+        **status,
+        "forecast_end_date": max(
+            (row["date"] for row in (forecast_rows + price_forecast_rows)), default=None),
+    }
 
 
 @app.get("/api/forecasts/latest")

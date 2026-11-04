@@ -1,4 +1,4 @@
-"""Streamlit visual QA dashboard for the three onion forecasting graphs.
+"""Streamlit visual QA dashboard for the onion forecasting graphs.
 
 This dashboard is for model/response inspection. The production frontend team can
 consume the same FastAPI endpoints; see FRONTEND_INTEGRATION.md.
@@ -656,6 +656,207 @@ if payload3:
         st.download_button("Download shortfall forecast CSV", bpred.to_csv(index=False), file_name="supply_demand_shortfall_forecast.csv", mime="text/csv", key="g3_balance_download")
 else:
     st.info("Select states, choose a horizon and click Update supply / demand outlook.")
+
+# ---------------------------------------------------------------------------
+# Graph 4 — monthly retail forecast with selectable context features.
+# ---------------------------------------------------------------------------
+st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
+section_heading(
+    "AP monthly retail price forecast",
+    "Monthly retail prices with supply-demand quantities and indicative shortfall / surplus.",
+)
+st.caption("Quantities and balance are shown in tonnes/month; retail prices are shown in ₹/kg.")
+g4_features = st.multiselect(
+    "Context features",
+    options=["wholesale", "arrival", "mandi", "retail", "production"],
+    default=["wholesale", "arrival", "mandi", "retail", "production"],
+    key="g4_features",
+    help="Selected features provide context for the monthly retail price forecast.",
+)
+range4 = date_range_control(
+    "g4_monthly_date_range",
+    "Monthly date range",
+    start_days_before=365,
+    end_days_after=180,
+)
+run4 = st.button("Update monthly retail outlook", type="primary", key="g4_run")
+if run4:
+    st.session_state["g4_started"] = True
+if run4 or st.session_state.get("g4_started", False):
+    with st.spinner("Forecasting monthly AP retail prices and supply-demand outlook..."):
+        try:
+            st.session_state["g4_payload"] = fetch_graph(
+                "/api/graphs/monthly-retail",
+                {
+                    "states": "AP",
+                    "start_date": range4[0].isoformat(),
+                    "end_date": range4[1].isoformat(),
+                    "features": ",".join(g4_features),
+                },
+            )
+            st.session_state["g4_error"] = None
+        except Exception as exc:
+            st.session_state["g4_error"] = str(exc)
+if st.session_state.get("g4_error"):
+    st.error(st.session_state["g4_error"])
+payload4 = st.session_state.get("g4_payload")
+if payload4:
+    set_freshness(payload4)
+    history4 = pd.DataFrame(payload4.get("historical", []))
+    quantity_history4 = (
+        history4[history4["metric"].isin(("production", "consumption", "arrival"))]
+        if not history4.empty and "metric" in history4 else pd.DataFrame()
+    )
+    retail_history4 = (
+        history4[history4["metric"] == "retail"]
+        if not history4.empty and "metric" in history4 else pd.DataFrame()
+    )
+    quantity4 = pd.DataFrame(payload4.get("quantity_forecast", []))
+    balance4 = pd.DataFrame(payload4.get("balance_forecast", []))
+    retail4 = pd.DataFrame(payload4.get("price_forecast", payload4.get("retail_forecast", [])))
+
+    with st.expander("Selected features and context logic"):
+        st.json({
+            "selected_features": payload4.get("selected_features", []),
+            "context_logic": payload4.get("context_logic", {}),
+        })
+
+    st.markdown("#### Monthly quantities and shortfall / surplus")
+    st.caption("Circles show actuals · Diamonds show forecast medians · Shading shows P10–P90 ranges.")
+    fig4 = go.Figure()
+    quantity_styles4 = {
+        "production": {"label": "Production", "color": "#18846B", "fill": "rgba(24,132,107,0.13)"},
+        "consumption": {"label": "Consumption", "color": "#4469A8", "fill": "rgba(68,105,168,0.13)"},
+        "arrival": {"label": "Arrivals", "color": "#C78422", "fill": "rgba(199,132,34,0.16)"},
+    }
+    for metric, style in quantity_styles4.items():
+        actual = (
+            quantity_history4[quantity_history4["metric"] == metric].sort_values("date")
+            if not quantity_history4.empty else pd.DataFrame()
+        )
+        forecast = (
+            quantity4[quantity4["metric"] == metric].sort_values("date")
+            if not quantity4.empty else pd.DataFrame()
+        )
+        if not actual.empty:
+            fig4.add_trace(go.Scatter(
+                x=actual["date"], y=actual["actual_quantity_tonnes_month"],
+                mode="lines+markers", name=f"{style['label']} · actual",
+                line={"color": style["color"], "width": 2.2},
+                marker={"color": style["color"], "size": 7, "symbol": "circle"},
+                hovertemplate="%{x|%b %Y}<br>Actual: %{y:,.0f} tonnes/month<extra></extra>",
+            ))
+        if not forecast.empty:
+            fig4.add_trace(go.Scatter(
+                x=forecast["date"], y=forecast["p90_tonnes_month"], mode="lines",
+                line={"color": style["color"], "width": 0},
+                showlegend=False, hoverinfo="skip",
+            ))
+            fig4.add_trace(go.Scatter(
+                x=forecast["date"], y=forecast["p10_tonnes_month"], mode="lines",
+                line={"color": style["color"], "width": 0},
+                fill="tonexty", fillcolor=style["fill"], showlegend=False, hoverinfo="skip",
+            ))
+            fig4.add_trace(go.Scatter(
+                x=forecast["date"], y=forecast["predicted_quantity_tonnes_month"],
+                mode="lines+markers", name=f"{style['label']} · forecast P50",
+                line={"color": style["color"], "width": 2.5, "dash": "dash"},
+                marker={"color": style["color"], "size": 8, "symbol": "diamond"},
+                hovertemplate="%{x|%b %Y}<br>Forecast: %{y:,.0f} tonnes/month<extra></extra>",
+            ))
+    if not balance4.empty:
+        balance4 = balance4.sort_values("date")
+        fig4.add_trace(go.Scatter(
+            x=balance4["date"], y=balance4["shortfall_p90_tonnes_month"], mode="lines",
+            line={"color": "#A63D40", "width": 0}, showlegend=False, hoverinfo="skip",
+        ))
+        fig4.add_trace(go.Scatter(
+            x=balance4["date"], y=balance4["shortfall_p10_tonnes_month"], mode="lines",
+            line={"color": "#A63D40", "width": 0}, fill="tonexty",
+            fillcolor="rgba(166,61,64,0.12)", showlegend=False, hoverinfo="skip",
+        ))
+        fig4.add_trace(go.Scatter(
+            x=balance4["date"], y=balance4["shortfall_p50_tonnes_month"],
+            mode="lines+markers", name="Shortfall / surplus · P50",
+            line={"color": "#A63D40", "width": 2.5, "dash": "dot"},
+            marker={"color": "#A63D40", "size": 8, "symbol": "diamond"},
+            hovertemplate="%{x|%b %Y}<br>Balance: %{y:,.0f} tonnes/month<extra></extra>",
+        ))
+    if payload4.get("forecast_start_date"):
+        fig4.add_vline(
+            x=payload4["forecast_start_date"], line_dash="dot", line_color="#8d96a5",
+            annotation_text="Forecast starts", annotation_position="top",
+        )
+    configure_chart(fig4, y_title="Tonnes per month", height=470)
+    quantity_dates4 = pd.concat(
+        [
+            quantity_history4["date"] if not quantity_history4.empty else pd.Series(dtype=str),
+            quantity4["date"] if not quantity4.empty else pd.Series(dtype=str),
+            balance4["date"] if not balance4.empty else pd.Series(dtype=str),
+        ],
+        ignore_index=True,
+    )
+    month_dates4 = pd.to_datetime(quantity_dates4).drop_duplicates().sort_values()
+    fig4.update_xaxes(
+        tickmode="array", tickvals=month_dates4,
+        ticktext=[month.strftime("%b %Y") for month in month_dates4],
+        tickangle=-35, automargin=True,
+    )
+    fig4.update_yaxes(tickformat=",.0f")
+    fig4.update_layout(margin={"l": 12, "r": 18, "t": 42, "b": 105}, legend={"orientation": "h", "y": -0.3, "x": 0})
+    st.plotly_chart(fig4, use_container_width=True)
+    st.caption("Shortfall = Consumption − (Arrival + Production). Positive values indicate potential shortfall; negative values indicate potential surplus.")
+
+    st.markdown("#### Monthly retail price")
+    price_fig4 = go.Figure()
+    if not retail_history4.empty:
+        retail_history4 = retail_history4.sort_values("date")
+        price_fig4.add_trace(go.Scatter(
+            x=retail_history4["date"], y=retail_history4["actual_price_rs_kg"],
+            mode="lines+markers", name="Retail · actual",
+            line={"color": "#4469A8", "width": 2.2},
+            marker={"color": "#4469A8", "size": 7, "symbol": "circle"},
+            hovertemplate="%{x|%b %Y}<br>Actual: ₹%{y:.2f}/kg<extra></extra>",
+        ))
+    if not retail4.empty:
+        retail4 = retail4.sort_values("date")
+        price_fig4.add_trace(go.Scatter(
+            x=retail4["date"], y=retail4["p90_rs_kg"], mode="lines",
+            line={"color": "#4469A8", "width": 0}, showlegend=False, hoverinfo="skip",
+        ))
+        price_fig4.add_trace(go.Scatter(
+            x=retail4["date"], y=retail4["p10_rs_kg"], mode="lines",
+            line={"color": "#4469A8", "width": 0}, fill="tonexty",
+            fillcolor="rgba(68,105,168,0.13)", showlegend=False, hoverinfo="skip",
+        ))
+        price_fig4.add_trace(go.Scatter(
+            x=retail4["date"], y=retail4["predicted_price_rs_kg"],
+            mode="lines+markers", name="Retail · forecast P50",
+            line={"color": "#4469A8", "width": 2.6, "dash": "dash"},
+            marker={"color": "#4469A8", "size": 8, "symbol": "diamond"},
+            hovertemplate="%{x|%b %Y}<br>Forecast: ₹%{y:.2f}/kg<extra></extra>",
+        ))
+    configure_chart(price_fig4, y_title="Price (₹/kg)", height=380)
+    st.plotly_chart(price_fig4, use_container_width=True)
+    if not quantity4.empty:
+        st.download_button(
+            "Download monthly quantity forecast CSV", quantity4.to_csv(index=False),
+            file_name="monthly_quantity_forecasts.csv", mime="text/csv", key="g4_quantity_download",
+        )
+    if not balance4.empty:
+        st.download_button(
+            "Download monthly balance forecast CSV", balance4.to_csv(index=False),
+            file_name="monthly_balance_forecasts.csv", mime="text/csv", key="g4_balance_download",
+        )
+    if not retail4.empty:
+        st.download_button(
+            "Download monthly retail forecast CSV", retail4.to_csv(index=False),
+            file_name="monthly_retail_forecasts.csv", mime="text/csv", key="g4_retail_download",
+        )
+    for warning in payload4.get("warnings", []):
+        st.warning(warning)
+else:
+    st.info("Select context features and a monthly date range, then click Update monthly retail outlook.")
 st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
 st.caption("Visual QA dashboard. The production frontend should call the same FastAPI endpoints. Weather / El Niño / cyclone scenarios are intentionally not included yet.")
 

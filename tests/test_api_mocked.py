@@ -77,6 +77,9 @@ def client_with_fake(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "get_pipeline", lambda: FakeChronosPipeline())
     monkeypatch.setattr(main, "date", FixedDate)
     monkeypatch.setenv("API_BEARER_TOKEN", "test-api-token")
+    # Keep the precompute scheduler out of endpoint tests; scheduler behavior is
+    # covered by the dedicated tests that call main._maybe_refresh_precomputed().
+    monkeypatch.setenv("PRECOMPUTE_SCHEDULER_ENABLED", "0")
     main._PREDICTION_CACHE.clear()
     FakeChronosPipeline.calls = []
     return TestClient(main.app)
@@ -215,6 +218,61 @@ def test_new_graph_datasets_are_loaded_into_mongodb(monkeypatch, tmp_path):
     monthly_count = db["ap_monthly_observations"].count_documents({})
     assert daily_count == 3
     assert monthly_count == 3
+
+
+def test_monthly_history_normalizes_price_aliases_from_mongodb(monkeypatch, tmp_path):
+    client_with_fake(monkeypatch, tmp_path)
+    history_store.load_ap_monthly_history()
+
+    db = db_client.get_db(TEST_DB_NAME)
+    db["ap_monthly_observations"].update_many(
+        {},
+        {"$set": {
+            "AP_avg_retail_price_rs_kg": 2.5,
+            "AP_avg_wholesale_price_rs_kg": 2.0,
+            "AP_avg_mandi_modal_rs_kg": 1.8,
+        }},
+    )
+
+    monthly = history_store.load_ap_monthly_history()
+
+    assert monthly["retail_price_rs_kg"].tolist() == [2.5, 2.5, 2.5]
+    assert monthly["wholesale_price_rs_kg"].tolist() == [2.0, 2.0, 2.0]
+    assert monthly["mandi_price_rs_kg"].tolist() == [1.8, 1.8, 1.8]
+
+
+def test_graph4_accepts_price_aliases_and_defaults_end_date(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    monthly_path = tmp_path / "monthly_ap_with_prices.csv"
+    pd.DataFrame([
+        {"month_start": "Aug-26", "production_t_month": 52000,
+         "consumption_t_month": 69000, "arrival_t_month": 4500,
+         "AP_avg_retail_price_rs_kg": 2.5,
+         "AP_avg_wholesale_price_rs_kg": 2.0,
+         "AP_avg_mandi_modal_rs_kg": 1.8},
+        {"month_start": "Sep-26", "production_t_month": 53000,
+         "consumption_t_month": 70000, "arrival_t_month": 4700,
+         "AP_avg_retail_price_rs_kg": 2.6,
+         "AP_avg_wholesale_price_rs_kg": 2.1,
+         "AP_avg_mandi_modal_rs_kg": 1.9},
+        {"month_start": "Oct-26", "production_t_month": 54000,
+         "consumption_t_month": 71000, "arrival_t_month": 4900,
+         "AP_avg_retail_price_rs_kg": 2.7,
+         "AP_avg_wholesale_price_rs_kg": 2.2,
+         "AP_avg_mandi_modal_rs_kg": 2.0},
+    ]).to_csv(monthly_path, index=False)
+    monkeypatch.setattr(history_store, "AP_MONTHLY_CSV_PATH", monthly_path)
+
+    response = client.get(
+        "/api/graphs/monthly-retail?states=AP&start_date=2025-11-04",
+        headers={"Authorization": "Bearer test-api-token"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["requested_end_date"] == "2027-03-30"
+    assert body["price_forecast"]
+    assert body["context_logic"]["wholesale"] == "wholesale_price_rs_kg"
 
 
 def test_dash_ingestion_updates_survive_graph_dataset_reload(monkeypatch, tmp_path):
@@ -519,3 +577,144 @@ def test_invalid_horizon_rejected(monkeypatch, tmp_path):
         headers={"Authorization": "Bearer test-api-token"},
     )
     assert response.status_code == 422
+
+
+def test_graph1_serves_precomputed_run_from_mongodb(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer test-api-token"}
+    # First request: DB has no run yet → on-demand fallback computes and persists.
+    first = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["saved_to_sqlite"]["run_id"] == 1
+    calls_after_first = list(FakeChronosPipeline.calls)
+    # Second identical request: the fresh stored run covers it, so it must be
+    # served from MongoDB with zero additional model calls and identical rows.
+    second = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert FakeChronosPipeline.calls == calls_after_first
+    assert body["forecast"] == first.json()["forecast"]
+    assert body["saved_to_sqlite"]["run_id"] == 1
+    served_meta = body["saved_to_sqlite"]
+    assert served_meta["graph_code"] == "graph1_ap_prices"
+    assert served_meta["saved_values"] == 5
+
+
+def test_graph1_reforecasts_when_precomputed_coverage_is_insufficient(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer test-api-token"}
+    narrow = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert narrow.status_code == 200
+    assert narrow.json()["saved_to_sqlite"]["run_id"] == 1
+    calls_before = list(FakeChronosPipeline.calls)
+    # Stored run only covers Oct 29–Nov 2: the longer range misses coverage and
+    # falls back to on-demand inference, saving a new run.
+    wider = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-09",
+        headers=headers,
+    )
+    assert wider.status_code == 200, wider.text
+    assert len(FakeChronosPipeline.calls) > len(calls_before)
+    body = wider.json()
+    assert body["saved_to_sqlite"]["run_id"] == 2
+    assert len(body["forecast"]) == 12
+
+
+def test_graph1_reforecasts_when_stored_run_turns_stale(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer test-api-token"}
+    first = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert first.json()["saved_to_sqlite"]["run_id"] == 1
+    db = db_client.get_db(TEST_DB_NAME)
+    db["forecast_runs"].update_many(
+        {}, {"$set": {"generated_at": "2026-10-20T00:00:00+00:00"}})
+    # Clear the inference cache so this deterministic fixture actually re-runs
+    # the model; in production the cache usually absorbs the recompute anyway.
+    main._PREDICTION_CACHE.clear()
+    calls_before = list(FakeChronosPipeline.calls)
+    second = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    assert len(FakeChronosPipeline.calls) > len(calls_before)
+    assert second.json()["saved_to_sqlite"]["run_id"] == 2
+
+
+def test_graph2_serves_precomputed_subset_from_mongodb(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer test-api-token"}
+    first = client.get(
+        "/api/graphs/state-comparison?states=AP,KA&price_types=retail,wholesale&start_date=2026-10-29&end_date=2026-11-09",
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    run_one = first.json()["saved_to_sqlite"]
+    calls_after_first = list(FakeChronosPipeline.calls)
+    # A narrower request (subset of stored series and dates) is sliced from the
+    # stored run without touching the model.
+    second = client.get(
+        "/api/graphs/state-comparison?states=AP,KA&price_types=wholesale&start_date=2026-10-30&end_date=2026-11-08",
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    body = second.json()
+    assert FakeChronosPipeline.calls == calls_after_first
+    assert {row["state"] for row in body["forecast"]} == {"AP", "KA"}
+    assert {row["price_type"] for row in body["forecast"]} == {"wholesale"}
+    assert len(body["forecast"]) == 2 * 10
+    assert body["saved_to_sqlite"] == run_one
+
+
+def test_precompute_scheduler_refreshes_full_grid_then_reuses_fresh_runs(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    headers = {"Authorization": "Bearer test-api-token"}
+    # A seconds-old on-demand run keeps graph1 "fresh"; graph2 has no run at all,
+    # so scheduler pass 1 immediately precomputes graph2's full grid.
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert FakeChronosPipeline.calls, "fallback inference should have run"
+    first_pass = main._maybe_refresh_precomputed()
+    assert set(first_pass) == {"graph2_state_comparison"}
+    db = db_client.get_db(TEST_DB_NAME)
+    values_before = db["forecast_values"].count_documents({})
+    # Age every run header; pass 2 must rebuild BOTH full grids.
+    db["forecast_runs"].update_many(
+        {}, {"$set": {"generated_at": "2026-10-20T00:00:00+00:00"}})
+    second_pass = main._maybe_refresh_precomputed()
+    assert set(second_pass) == {"graph1_ap_prices", "graph2_state_comparison"}
+    meta_graph1 = history_store.get_latest_run_meta("graph1_ap_prices")
+    meta_graph2 = history_store.get_latest_run_meta("graph2_state_comparison")
+    assert meta_graph1["horizon_days"] == main.PRECOMPUTE_HORIZON_DAYS == 180
+    assert meta_graph2["horizon_days"] == 180
+    assert meta_graph2["last_observation_date"] == "2026-10-25"
+    graph1_run_id = meta_graph1["run_id"]
+    graph2_run_id = meta_graph2["run_id"]
+    assert graph1_run_id != graph2_run_id
+    values_delta = db["forecast_values"].count_documents({}) - values_before
+    assert values_delta == (3 + 12) * 180  # full-grid runs persisted
+    # Fresh full-grid runs mean the next scheduler pass must be a no-op.
+    assert main._maybe_refresh_precomputed() == {}
+    # Any graph request is now served straight from the full-grid run.
+    served = client.get(
+        "/api/graphs/state-comparison?states=MH&price_types=mandi_modal&start_date=2026-10-29&end_date=2026-11-02",
+        headers=headers,
+    )
+    assert served.status_code == 200, served.text
+    assert len(served.json()["forecast"]) == 5
+    assert served.json()["saved_to_sqlite"]["run_id"] == graph2_run_id

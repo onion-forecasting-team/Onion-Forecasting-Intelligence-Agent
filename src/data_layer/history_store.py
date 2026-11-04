@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / "config" / ".env")
 DEFAULT_CSV = ROOT / "data" / "Onion_Model_Ready_Dataset_Chronos2_2026-10-26_Interpolated_Metric_Quintal.csv"
 DEFAULT_DAILY_PRICE_CSV = ROOT / "data" / "Onion_Daily_Price_Forecasting_Dataset_2022-01-01_to_2026-10-25.csv"
-DEFAULT_AP_MONTHLY_CSV = ROOT / "data" / "Onion_AP_Monthly_Dataset_2022-01_to_2026-10.csv"
+DEFAULT_AP_MONTHLY_CSV = ROOT / "data" / "Onion_AP_Monthly_Dataset_with_Prices_2022-01_to_2026-10.csv"
 STATE_CODES = ("AP", "KA", "MH", "MP")
 STATE_NAMES = {"AP": "Andhra Pradesh", "KA": "Karnataka", "MH": "Maharashtra", "MP": "Madhya Pradesh"}
 
@@ -233,8 +233,25 @@ def normalize_daily_price_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return _validate_graph_frame(out[DAILY_GRAPH_COLUMNS], "timestamp", "D")
 
 
+MONTHLY_RETAIL_PRICE_ALIASES = {
+    "retail_price_rs_kg": (
+        "AP_avg_retail_price_rs_kg", "avg_retail_price_rs_kg",
+        "retail_price_rs_kg", "AP_retail_rs_kg"),
+    "wholesale_price_rs_kg": (
+        "AP_avg_wholesale_price_rs_kg", "avg_wholesale_price_rs_kg",
+        "wholesale_price_rs_kg", "AP_wholesale_rs_kg"),
+    "mandi_price_rs_kg": (
+        "AP_avg_mandi_modal_rs_kg", "avg_mandi_price_rs_kg",
+        "mandi_price_rs_kg", "AP_mandi_modal_rs_kg"),
+}
+
+
 def normalize_ap_monthly_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Normalize monthly AP quantities, preserving their source tonnes/month units."""
+    """Normalize monthly AP quantities, preserving their source tonnes/month units.
+
+    Optional monthly price columns are canonicalized to retail_price_rs_kg,
+    wholesale_price_rs_kg and mandi_price_rs_kg when any alias is present.
+    """
     src = frame.copy()
     src.columns = [str(c).replace("\ufeff", "").strip() for c in src.columns]
     if "month_start" not in src.columns:
@@ -252,7 +269,16 @@ def normalize_ap_monthly_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "month_start": parsed.dt.to_period("M").dt.to_timestamp(),
         **{column: src[column] for column in required},
     })
-    return _validate_graph_frame(out[MONTHLY_GRAPH_COLUMNS], "month_start", "MS")
+    for canonical, aliases in MONTHLY_RETAIL_PRICE_ALIASES.items():
+        for alias in aliases:
+            if alias in src.columns:
+                out[canonical] = src[alias]
+                break
+    columns = ["month_start", *required]
+    columns.extend(
+        canonical for canonical in MONTHLY_RETAIL_PRICE_ALIASES
+        if canonical in out.columns)
+    return _validate_graph_frame(out[columns], "month_start", "MS")
 
 
 # ---------------------------------------------------------------------------
@@ -441,16 +467,24 @@ def sync_daily_price_csv_from_graph(dates: Iterable[str]) -> dict[str, int]:
 
 
 def load_ap_monthly_history() -> pd.DataFrame:
+    # Prefer the MongoDB "Monthly retail" collection when it exists so the API
+    # uses MongoDB as its runtime source of monthly observations.
+    try:
+        db = get_db()
+        docs = list(db["Monthly retail"].find({}, {"_id": 0}))
+    except Exception:
+        docs = []
+    if docs:
+        frame = normalize_ap_monthly_frame(pd.DataFrame(docs))
+        if "month_start" in frame.columns:
+            frame["month_start"] = pd.to_datetime(frame["month_start"])
+        return frame
+
     if not AP_MONTHLY_CSV_PATH.exists():
         raise FileNotFoundError(f"Monthly AP dataset not found: {AP_MONTHLY_CSV_PATH}")
     frame = normalize_ap_monthly_frame(
         pd.read_csv(AP_MONTHLY_CSV_PATH, encoding="utf-8-sig"))
-    _sync_graph_dataset("ap_monthly", AP_MONTHLY_CSV_PATH,
-                        "ap_monthly_observations", frame, "month_start")
-    db = get_db()
-    stored = _collection_rows(db, "ap_monthly_observations", MONTHLY_GRAPH_COLUMNS, "month_start")
-    stored["month_start"] = pd.to_datetime(stored["month_start"])
-    return stored
+    return frame
 
 
 def ensure_graph_datasets_ready() -> None:
@@ -1019,6 +1053,19 @@ def get_latest_forecast(graph_code: str | None = None) -> dict[str, Any] | None:
     result["metadata"] = json.loads(row.get("metadata_json") or "{}")
     result["forecast_values"] = values
     return result
+
+
+def get_latest_run_meta(graph_code: str | None = None) -> dict[str, Any] | None:
+    """Latest run header only (no forecast value rows) — cheap freshness check."""
+    ensure_store_ready()
+    db = get_db()
+    match = {"graph_code": graph_code} if graph_code else {}
+    row = db.forecast_runs.find_one(
+        match,
+        {"_id": 0, "metadata_json": 0},
+        sort=[("generated_at", -1), ("run_id", -1)],
+    )
+    return dict(row) if row else None
 
 
 def list_forecast_runs(limit: int = 20) -> list[dict[str, Any]]:

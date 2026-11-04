@@ -11,6 +11,7 @@ This document covers all API endpoints, parameters, request headers, service log
 - **ReDoc**: `http://127.0.0.1:8000/redoc`
 - **Authentication**: All `/api/*` routes except CSV import require `Authorization: Bearer <API_BEARER_TOKEN>`.
 - **Model Engine**: Amazon Chronos-2 (`amazon/chronos-2`) probabilistic zero-shot time-series model
+- **Forecast serving (Graphs 1/2)**: DB-first — responses are sliced from the latest precomputed MongoDB run (full-grid forecast, `PRECOMPUTE_HORIZON_DAYS`, default 180 days). A background scheduler regenerates the grid every `PRECOMPUTE_REFRESH_DAYS` days (default 5) on a strict wall-clock cadence; daily data ingestion does not trigger reforecast. Chronos-2 runs on the request path only when no fresh run covers the requested selection (on-demand fallback, which also persists a new run). Graph 3 remains fully on-demand.
 - **Database**: MongoDB (`MONGO_URI` from `config/.env`; database `MONGO_DB_NAME`, default `onion_forecasting`). Collections mirror the former SQLite tables one-for-one (same field names and key semantics), documents carry `version: 1` schema stamps, and sequential ids (`forecast_run_id`, ingestion-log ids, chat message numbers) come from an app-managed `counters` collection. The legacy SQLite file is intentionally retained read-only as the verified restore source (`scripts/restore_from_sqlite_backup.py` can rebuild MongoDB from it at any time).
 - **Key Units**:
   - Observation prices in MongoDB: ₹ / metric quintal
@@ -18,6 +19,7 @@ This document covers all API endpoints, parameters, request headers, service log
   - Historical prices returned in graphs: ₹ / kg (converted for direct comparison with forecasts)
   - Graph 1/2 daily arrivals: Metric quintals / day in model context
   - Graph 3 AP production, consumption, arrivals, and shortfall: Tonnes / month
+- **Precompute knobs** (`config/.env`): `PRECOMPUTE_SCHEDULER_ENABLED` (default `1`), `PRECOMPUTE_HORIZON_DAYS` (`180`, capped at the API 180-day limit), `PRECOMPUTE_REFRESH_DAYS` (`5`), `PRECOMPUTE_CHECK_INTERVAL_MIN` (`15`).
 
 Protected data and forecast routes require `Authorization: Bearer <API_BEARER_TOKEN>`.
 Configure `API_BEARER_TOKEN` in the API server's `.env`; keep the value in a trusted
@@ -33,7 +35,7 @@ MongoDB in every case:
 
 | Response key | Where it appears | Meaning today |
 |---|---|---|
-| `saved_to_sqlite` | Graph 1/2/3 responses | Run metadata for the forecast that was just persisted (run id, timestamp, value count, graph code). Persisted to the MongoDB store despite the historic key name. |
+| `saved_to_sqlite` | Graph 1/2/3 responses | Run metadata for the forecast run that served the response (run id, timestamp, total value count, graph code). For Graph 1/2 this is the precomputed background-refresh run — or, when the fallback path ran, the just-persisted run. Persisted to the MongoDB store despite the historic key name. |
 | `database_path` | `/health` → `ingestion`, `/api/ingestion/status`, sync-csv `history` | Snapshot label of the configured MongoDB store, with credentials redacted (e.g. `mongodb+srv://***@cluster.../onion_forecasting`). |
 | `id` | `last_ingestion` objects; `/api/chat/history` messages | Sequential audit-log number / chat message sequence number. Backend fields `ingestion_log.id` and `chat_messages.seq` are serialized to clients as `id`. |
 | `store_engine` | `/health`, `/health → ingestion`, `/api/ingestion/status` | Always `"mongodb"`; lets callers verify which storage backend served the response. |
@@ -56,9 +58,11 @@ Not present for Graph 3 (`available: False`).
 
 ## 1. Core Forecasting Graph APIs
 
-These endpoints execute Chronos-2 predictions on historical market data and automatically persist forecast runs and quantile values to MongoDB.
+These endpoints serve Chronos-2 predictions backed by MongoDB. Graphs 1 and 2 are DB-first: each response slices the latest precomputed full-grid run (180 days, regenerated automatically every `PRECOMPUTE_REFRESH_DAYS` days by the background scheduler). Chronos-2 inference happens on the request path only as a fallback when no run younger than that refresh interval covers the requested states/price types/date range; fallback runs are persisted like before. Graph 3 remains fully on-demand. All interaction results are stored in MongoDB as forecast runs and quantile values.
 
-All three graph endpoints require `start_date` and `end_date` in `YYYY-MM-DD` format.
+Graphs 1–3 require `start_date` and `end_date` in `YYYY-MM-DD` format. Graph 4
+requires `start_date`; `end_date` is optional and defaults to 180 days after the
+latest monthly observation.
 Actual observations and forecast records are returned only inside this inclusive date
 range. Graphs 1 and 2 use daily data and forecast from the day after the latest
 observation. Graph 3 uses monthly AP data and forecasts month-start periods through the
@@ -67,9 +71,10 @@ graphs. `horizon_days` remains the calendar-day distance from the latest source 
 the requested end date, capped at 180. If `end_date` exceeds the supported horizon, the
 API forecasts through the latest supported date and returns a successful, partial-range
 response rather than rejecting the request. Graph 3 forecasts month-start periods through
-the last monthly observation not beyond that date. Successful forecasts are saved to
-MongoDB and identical predictions may be reused from the API's in-memory cache.
-`start_date` must be on or before `end_date`.
+the last monthly observation not beyond that date. Graph 1/2 responses are built from
+MongoDB-stored quantile values: the latest precomputed grid run when fresh, otherwise a
+fallback run computed at request time and saved. Graph 3 saves its on-demand run per
+request. `start_date` must be on or before `end_date`.
 
 The 180-day cap is measured from the latest observation in the API server's database,
 not from `start_date` or from the length of the selected display range. If a short
@@ -446,7 +451,7 @@ GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-
 
 ## 2. Forecast Persistence & Run History APIs
 
-Every forecast generated by the graph endpoints is automatically stored in MongoDB. These endpoints allow querying stored runs.
+Every Graph 1/2/3 forecast run is stored in MongoDB: the background scheduler persists a fresh full-grid run for Graphs 1/2 every `PRECOMPUTE_REFRESH_DAYS` days, fallback inference stores its run too, and each Graph 3 request persists its run. These endpoints allow querying stored runs.
 
 ### 2.1 Get Latest Saved Forecast
 - **Method**: `GET`
