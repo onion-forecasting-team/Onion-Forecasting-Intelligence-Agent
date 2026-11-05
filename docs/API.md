@@ -449,6 +449,33 @@ GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-
 
 ---
 
+### 1.4 Graph 4: AP Monthly Retail Price Forecast
+*Endpoint for forecasting monthly AP retail prices with selectable monthly context.*
+
+- **Method**: `GET`
+- **Path**: `/api/graphs/monthly-retail`
+- **Source**: Reads MongoDB collection `Monthly retail` directly. This endpoint does not sync from a CSV or read `ap_monthly_observations`.
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `states` | string | No | `AP` | AP only. |
+| `start_date` | date | Yes | — | First date to include, `YYYY-MM-DD`. |
+| `end_date` | date | No | Latest monthly observation + 180 days | Requested final date, `YYYY-MM-DD`. |
+| `features` | string | No | `wholesale,mandi` | Comma-separated context inputs: `wholesale`, `mandi`, `arrival`, `production`, and/or `consumption`. Retail is the forecast target. |
+
+The collection's `AP_avg_retail_price_rs_kg`, `AP_avg_wholesale_price_rs_kg`, and
+`AP_avg_mandi_modal_rs_kg` fields are normalized for forecasting. The response
+includes the retail forecast in `price_forecast`, monthly quantity forecasts in
+`quantity_forecast`, and the supply-demand balance in `balance_forecast`.
+
+#### Example Request:
+```http
+GET /api/graphs/monthly-retail?states=AP&start_date=2026-10-01&features=wholesale%2Cmandi%2Carrival
+```
+
+---
+
 ## 2. Forecast Persistence & Run History APIs
 
 Every Graph 1/2/3 forecast run is stored in MongoDB: the background scheduler persists a fresh full-grid run for Graphs 1/2 every `PRECOMPUTE_REFRESH_DAYS` days, fallback inference stores its run too, and each Graph 3 request persists its run. These endpoints allow querying stored runs.

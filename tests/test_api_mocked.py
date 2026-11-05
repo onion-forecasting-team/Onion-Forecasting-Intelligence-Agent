@@ -241,10 +241,41 @@ def test_monthly_history_normalizes_price_aliases_from_mongodb(monkeypatch, tmp_
     assert monthly["mandi_price_rs_kg"].tolist() == [1.8, 1.8, 1.8]
 
 
-def test_graph4_accepts_price_aliases_and_defaults_end_date(monkeypatch, tmp_path):
-    client = client_with_fake(monkeypatch, tmp_path)
-    monthly_path = tmp_path / "monthly_ap_with_prices.csv"
-    pd.DataFrame([
+def test_monthly_retail_history_reads_only_monthly_retail_collection(monkeypatch, tmp_path):
+    documents = [{
+        "month_start": f"2026-{month:02d}-01",
+        "production_t_month": 52000 + month,
+        "consumption_t_month": 69000 + month,
+        "arrival_t_month": 4500 + month,
+        "AP_avg_retail_price_rs_kg": 2.5 + month / 100,
+        "AP_avg_wholesale_price_rs_kg": 2.0 + month / 100,
+        "AP_avg_mandi_modal_rs_kg": 1.8 + month / 100,
+    } for month in (8, 9, 10)]
+
+    class MonthlyRetailCollection:
+        def find(self, query, projection):
+            assert query == {}
+            assert projection == {"_id": 0}
+            return documents
+
+    class MongoDatabase:
+        def __getitem__(self, collection_name):
+            assert collection_name == "Monthly retail"
+            return MonthlyRetailCollection()
+
+    monkeypatch.setattr(history_store, "get_db", lambda: MongoDatabase())
+    monkeypatch.setattr(history_store, "AP_MONTHLY_CSV_PATH", tmp_path / "does_not_exist.csv")
+
+    monthly = history_store.load_monthly_retail_history()
+
+    assert len(monthly) == 3
+    assert monthly.iloc[-1]["retail_price_rs_kg"] == 2.6
+    assert monthly.iloc[-1]["wholesale_price_rs_kg"] == 2.1
+    assert round(monthly.iloc[-1]["mandi_price_rs_kg"], 1) == 1.9
+
+
+def test_graph4_accepts_price_aliases_and_defaults_end_date(monkeypatch):
+    monthly = history_store.normalize_ap_monthly_frame(pd.DataFrame([
         {"month_start": "Aug-26", "production_t_month": 52000,
          "consumption_t_month": 69000, "arrival_t_month": 4500,
          "AP_avg_retail_price_rs_kg": 2.5,
@@ -260,11 +291,29 @@ def test_graph4_accepts_price_aliases_and_defaults_end_date(monkeypatch, tmp_pat
          "AP_avg_retail_price_rs_kg": 2.7,
          "AP_avg_wholesale_price_rs_kg": 2.2,
          "AP_avg_mandi_modal_rs_kg": 2.0},
-    ]).to_csv(monthly_path, index=False)
-    monkeypatch.setattr(history_store, "AP_MONTHLY_CSV_PATH", monthly_path)
+    ]))
+    monkeypatch.setattr(main, "get_monthly_retail_data", lambda: monthly.copy())
+    monkeypatch.setattr(main, "get_pipeline", lambda: FakeChronosPipeline())
+    monkeypatch.setattr(main, "date", FixedDate)
+    monkeypatch.setattr(main, "PRECOMPUTE_SCHEDULER_ENABLED", False)
+    monkeypatch.setattr(
+        main,
+        "save_forecast_run",
+        lambda *args: {
+            "run_id": "test-run",
+            "generated_at": "2026-10-29T00:00:00Z",
+            "saved_values": len(args[4]),
+            "graph_code": args[0],
+        },
+    )
+    monkeypatch.setenv("API_BEARER_TOKEN", "test-api-token")
+    main._PREDICTION_CACHE.clear()
+    FakeChronosPipeline.calls = []
+    client = TestClient(main.app)
 
     response = client.get(
-        "/api/graphs/monthly-retail?states=AP&start_date=2025-11-04",
+        "/api/graphs/monthly-retail?states=AP&start_date=2025-11-04"
+        "&features=wholesale,mandi,consumption",
         headers={"Authorization": "Bearer test-api-token"},
     )
 
@@ -273,6 +322,11 @@ def test_graph4_accepts_price_aliases_and_defaults_end_date(monkeypatch, tmp_pat
     assert body["requested_end_date"] == "2027-03-30"
     assert body["price_forecast"]
     assert body["context_logic"]["wholesale"] == "wholesale_price_rs_kg"
+    assert body["selected_features"] == ["wholesale", "mandi", "consumption"]
+    retail_call = next(call for call in FakeChronosPipeline.calls
+                       if call["target"] == "retail_price_rs_kg")
+    assert "consumption_t_month" in retail_call["columns"]
+    assert "consumption_t_month" in retail_call["future_columns"]
 
 
 def test_dash_ingestion_updates_survive_graph_dataset_reload(monkeypatch, tmp_path):

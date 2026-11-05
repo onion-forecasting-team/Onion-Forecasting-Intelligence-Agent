@@ -665,14 +665,30 @@ section_heading(
     "AP monthly retail price forecast",
     "Monthly retail prices with supply-demand quantities and indicative shortfall / surplus.",
 )
-st.caption("Quantities and balance are shown in tonnes/month; retail prices are shown in ₹/kg.")
-g4_features = st.multiselect(
-    "Context features",
-    options=["wholesale", "arrival", "mandi", "retail", "production"],
-    default=["wholesale", "arrival", "mandi", "retail", "production"],
-    key="g4_features",
-    help="Selected features provide context for the monthly retail price forecast.",
+st.caption(
+    "Retail is the forecast target. Every scenario includes wholesale and mandi context; "
+    "optional monthly quantities are added to that baseline. Quantities are in tonnes/month "
+    "and retail prices are in ₹/kg."
 )
+g4_scenarios = {
+    "Baseline": ["wholesale", "mandi"],
+    "Baseline + arrivals": ["wholesale", "mandi", "arrival"],
+    "Baseline + production": ["wholesale", "mandi", "production"],
+    "Baseline + consumption": ["wholesale", "mandi", "consumption"],
+    "Baseline + production + consumption": [
+        "wholesale", "mandi", "production", "consumption",
+    ],
+    "Baseline + arrivals + production + consumption": [
+        "wholesale", "mandi", "arrival", "production", "consumption",
+    ],
+}
+g4_scenario = st.selectbox(
+    "Retail forecast scenario",
+    options=list(g4_scenarios),
+    key="g4_scenario",
+    help="Choose the monthly context features used to forecast retail prices.",
+)
+g4_features = g4_scenarios[g4_scenario]
 range4 = date_range_control(
     "g4_monthly_date_range",
     "Monthly date range",
@@ -717,6 +733,7 @@ if payload4:
 
     with st.expander("Selected features and context logic"):
         st.json({
+            "scenario": g4_scenario,
             "selected_features": payload4.get("selected_features", []),
             "context_logic": payload4.get("context_logic", {}),
         })

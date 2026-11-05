@@ -35,8 +35,8 @@ from history_store import (
     CSV_PATH, PRICE_COLUMNS, QUANTITY_COLUMNS,
     STATE_CODES, STATE_NAMES, get_latest_forecast, get_latest_run_meta,
     ingestion_status, list_forecast_runs,
-    load_ap_monthly_history, load_daily_price_history, save_forecast_run,
-    sync_model_ready_csv,
+    load_ap_monthly_history, load_daily_price_history, load_monthly_retail_history,
+    save_forecast_run, sync_model_ready_csv,
 )
 import history_store  # for store_label() (MongoDB store identity in /health)
 
@@ -67,6 +67,7 @@ MONTHLY_RETAIL_FEATURES = {
     "mandi": "mandi_price_rs_kg",
     "retail": "retail_price_rs_kg",
     "production": "production_t_month",
+    "consumption": "consumption_t_month",
 }
 
 # DB-first serving: Graph 1/2 responses are sliced from the latest precomputed
@@ -195,6 +196,17 @@ def get_monthly_data() -> pd.DataFrame:
         logger.exception("Could not load monthly AP quantity history")
         raise HTTPException(
             status_code=500, detail=f"Could not load monthly AP quantity history: {exc}") from exc
+
+
+def get_monthly_retail_data() -> pd.DataFrame:
+    try:
+        return load_monthly_retail_history()
+    except Exception as exc:
+        logger.exception("Could not load monthly retail history from MongoDB")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not load monthly retail history from MongoDB: {exc}",
+        ) from exc
 
 
 @lru_cache(maxsize=1)
@@ -1191,11 +1203,12 @@ def monthly_retail_graph(
                      "Defaults to the maximum supported date after the latest monthly observation."),
     ),
     features: str = Query(
-        "wholesale,arrival,mandi,retail,production",
-        description="Comma-separated retail context features: wholesale, arrival, mandi, retail, production",
+        "wholesale,mandi",
+        description=("Comma-separated retail context features: wholesale, arrival, mandi, "
+                     "retail, production, consumption"),
     ),
 ) -> dict:
-    data = get_monthly_data().rename(columns={"month_start": "timestamp"})
+    data = get_monthly_retail_data().rename(columns={"month_start": "timestamp"})
     if end_date is None:
         latest_observation = pd.Timestamp(data["timestamp"].max()).date()
         end_date = latest_observation + timedelta(days=MAX_FORECAST_HORIZON_DAYS)
@@ -1216,7 +1229,8 @@ def monthly_retail_graph(
             status_code=422,
             detail=f"Unsupported features: {unknown}. Allowed: {sorted(MONTHLY_RETAIL_FEATURES)}",
         )
-    missing = [feature for feature in requested_features
+    required_features = list(dict.fromkeys(["retail", *requested_features]))
+    missing = [feature for feature in required_features
                if MONTHLY_RETAIL_FEATURES[feature] not in data.columns]
     if missing:
         raise HTTPException(
@@ -1289,6 +1303,13 @@ def monthly_retail_graph(
                 future_covariate_frames.append(pd.DataFrame({
                     "timestamp": [pd.Timestamp(item[0]) for item in production_series],
                     "production_t_month": [item[2] for item in production_series],
+                }))
+        if "consumption" in covariate_features:
+            consumption_series = metric_forecasts.get("consumption", [])
+            if consumption_series:
+                future_covariate_frames.append(pd.DataFrame({
+                    "timestamp": [pd.Timestamp(item[0]) for item in consumption_series],
+                    "consumption_t_month": [item[2] for item in consumption_series],
                 }))
         if "wholesale" in covariate_features:
             result = _run_target(data, "wholesale_price_rs_kg", horizon_months, freq="MS")

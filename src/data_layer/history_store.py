@@ -487,6 +487,15 @@ def load_ap_monthly_history() -> pd.DataFrame:
     return frame
 
 
+def load_monthly_retail_history() -> pd.DataFrame:
+    """Load Graph 4 observations directly from MongoDB's Monthly retail collection."""
+    db = get_db()
+    documents = list(db["Monthly retail"].find({}, {"_id": 0}))
+    if not documents:
+        raise ValueError("MongoDB collection 'Monthly retail' contains no observations.")
+    return normalize_ap_monthly_frame(pd.DataFrame(documents))
+
+
 def ensure_graph_datasets_ready() -> None:
     """Import the configured graph datasets when their MongoDB collections are empty."""
     db = get_db()
