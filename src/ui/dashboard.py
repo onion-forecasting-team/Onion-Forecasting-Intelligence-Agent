@@ -913,7 +913,7 @@ DISTRICT_OPTIONS5 = [
     "Ananthapuramu", "Chittoor", "East Godavari", "Guntur", "Kakinada",
     "Konaseema", "Krishna", "Kurnool", "Ntr", "Palnadu",
     "Parvathipuram Manyam", "Prakasam", "Srikakulam", "Tirupati",
-    "Visakapatnam", "Vizianagaram",
+    "Visakapatnam", "Vizianagaram", "YSR",
 ]
 g5_districts = st.multiselect(
     "Districts (choose 1–2)",

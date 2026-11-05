@@ -621,9 +621,15 @@ GET /api/graphs/monthly-retail?states=AP&start_date=2026-09-01&end_date=2026-12-
 - **Description**: District-level daily retail onion price history and forecasts. Historical values come from MongoDB collection `district_wise_data`; forecast values come from `forecast_district_wise_data`. Both datasets are precomputed, so no model inference happens on the request path and no 180-day horizon cap is applied. Each request that returns at least one forecast row is persisted under `graph_code = graph5_district_retail` (`state_code` = district name, `target_key` = `retail`).
 
 #### Supported districts
-Exactly the 16 district columns present in `forecast_district_wise_data`. Names must match (case-insensitive reading is supported; do not fuzzy-match):
+Exactly the 17 district columns present in `forecast_district_wise_data`. Names must match (case-insensitive reading is supported; do not fuzzy-match):
 
-`Ananthapuramu`, `Chittoor`, `East Godavari`, `Guntur`, `Kakinada`, `Konaseema`, `Krishna`, `Kurnool`, `Ntr`, `Palnadu`, `Parvathipuram Manyam`, `Prakasam`, `Srikakulam`, `Tirupati`, `Visakapatnam`, `Vizianagaram`
+`Ananthapuramu`, `Chittoor`, `East Godavari`, `Guntur`, `Kakinada`, `Konaseema`, `Krishna`, `Kurnool`, `Ntr`, `Palnadu`, `Parvathipuram Manyam`, `Prakasam`, `Srikakulam`, `Tirupati`, `Visakapatnam`, `Vizianagaram`, `YSR`
+
+The YSR district (YSR Kadapa) is stored as `YSR`. The raw district CSVs name the
+column `Y.S.R`; because MongoDB expands dotted keys into nested documents, the
+ingested collections carried it as `Y -> S -> R`. `scripts/repair_ysr_district.py`
+flattened it into the top-level `YSR` key in both collections (idempotent; safe to
+re-run if the raw CSVs are ever re-ingested via a dotted column name).
 
 #### Query Parameters:
 | Parameter | Type | Required | Default | Description |
@@ -650,7 +656,7 @@ GET /api/graphs/district-retail?districts=Chittoor&start_date=2026-10-01&end_dat
   "graph": "district_retail_forecast",
   "title": "District Retail Onion Price Forecast",
   "selected_districts": ["Chittoor"],
-  "supported_districts": ["Ananthapuramu", "Chittoor", "East Godavari", "Guntur", "Kakinada", "Konaseema", "Krishna", "Kurnool", "Ntr", "Palnadu", "Parvathipuram Manyam", "Prakasam", "Srikakulam", "Tirupati", "Visakapatnam", "Vizianagaram"],
+  "supported_districts": ["Ananthapuramu", "Chittoor", "East Godavari", "Guntur", "Kakinada", "Konaseema", "Krishna", "Kurnool", "Ntr", "Palnadu", "Parvathipuram Manyam", "Prakasam", "Srikakulam", "Tirupati", "Visakapatnam", "Vizianagaram", "YSR"],
   "historical": [
     {
       "date": "2026-10-01",
