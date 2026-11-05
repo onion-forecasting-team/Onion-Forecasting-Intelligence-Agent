@@ -68,23 +68,40 @@ with st.sidebar:
     st.caption("P50 is the median forecast. P10–P90 is a nominal 80% prediction interval, not a calibrated confidence score.")
 
 
+def api_unreachable_message(base_url: str) -> str:
+    return (
+        "FastAPI is not running or is unreachable at "
+        f"{base_url}. Start the API server first, then refresh this page.\n\n"
+        "Example:\n"
+        "From the project root, run:\n"
+        ".venv\\Scripts\\python.exe -m uvicorn main:app --app-dir src/api "
+        "--host 127.0.0.1 --port 8000"
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def api_get(url: str, params: tuple[tuple[str, Any], ...]) -> dict:
     token = os.getenv("API_BEARER_TOKEN", "").strip()
     if not token:
         raise RuntimeError("API_BEARER_TOKEN is missing from the dashboard environment.")
 
-    response = requests.get(
-        url,
-        params=dict(params),
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=1800,
-    )
+    try:
+        response = requests.get(
+            url,
+            params=dict(params),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=1800,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(api_unreachable_message(url.rsplit("/api", 1)[0])) from exc
+
     try:
         body = response.json()
     except ValueError:
         body = {"detail": response.text[:1000]}
     if not response.ok:
+        if response.status_code in {500, 404} and "Connection refused" in str(body.get("detail", "")):
+            raise RuntimeError(api_unreachable_message(url.rsplit("/api", 1)[0]))
         raise RuntimeError(body.get("detail", f"API HTTP {response.status_code}"))
     return body
 
