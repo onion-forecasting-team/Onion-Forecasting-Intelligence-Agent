@@ -874,6 +874,238 @@ if payload4:
         st.warning(warning)
 else:
     st.info("Select context features and a monthly date range, then click Update monthly retail outlook.")
+
+# ---------------------------------------------------------------------------
+# Graph 5 — district retail price forecast for up to two districts.
+#    Actuals come from the district_wise_data collection and forecasts from
+#    forecast_district_wise_data (MongoDB, read through the API endpoint
+#    /api/graphs/district-retail).
+# ---------------------------------------------------------------------------
+st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
+section_heading(
+    "District retail price forecast",
+    "Daily district-level onion retail prices · Observed values vs precomputed forecasts · Pick up to two districts.",
+)
+st.caption(
+    "Solid lines show observed district retail prices and dashed lines show the "
+    "precomputed daily forecast medians. Prices are in ₹/kg."
+)
+# Mirrors the district columns of the MongoDB forecast_district_wise_data
+# collection. Keep in sync with that collection; the API rejects other names.
+DISTRICT_OPTIONS5 = [
+    "Ananthapuramu", "Chittoor", "East Godavari", "Guntur", "Kakinada",
+    "Konaseema", "Krishna", "Kurnool", "Ntr", "Palnadu",
+    "Parvathipuram Manyam", "Prakasam", "Srikakulam", "Tirupati",
+    "Visakapatnam", "Vizianagaram", "YSR",
+]
+g5_districts = st.multiselect(
+    "Districts (choose 1–2)",
+    options=DISTRICT_OPTIONS5,
+    default=["Chittoor"],
+    max_selections=2,
+    key="g5_districts",
+    help="Only districts present in the forecast dataset can be selected.",
+)
+g5_horizons = {
+    "7 days": 7,
+    "14 days": 14,
+    "1 month": 30,
+    "2 months": 60,
+    "6 months": 180,
+    "Custom date range": None,
+}
+# Days of history shown before the last observation for each fixed horizon.
+g5_horizon_history_days = {
+    "7 days": 30, "14 days": 30, "1 month": 60, "2 months": 60, "6 months": 90,
+}
+g5_horizon = st.selectbox(
+    "Forecast horizon",
+    options=list(g5_horizons),
+    key="g5_horizon",
+    help=("Percentage change compares the last observed price with the forecasted "
+          "price at the end of this horizon."),
+)
+horizon_days5 = g5_horizons[g5_horizon]
+range5 = None
+if horizon_days5 is None:
+    range5 = date_range_control(
+        "g5_district_date_range",
+        "District date range",
+        start_days_before=90,
+        end_days_after=180,
+    )
+run5 = st.button("Update district outlook", type="primary", key="g5_run")
+if run5:
+    st.session_state["g5_started"] = True
+if g5_districts and (horizon_days5 is not None or range5) and (
+        run5 or st.session_state.get("g5_started", False)):
+    with st.spinner("Loading district retail prices and forecasts..."):
+        try:
+            if horizon_days5 is not None:
+                start_back = g5_horizon_history_days[g5_horizon]
+                g5_params = {
+                    "districts": ",".join(g5_districts),
+                    "horizon_days": horizon_days5,
+                    "start_date": (date.today() - timedelta(days=start_back)).isoformat(),
+                }
+            else:
+                g5_params = {
+                    "districts": ",".join(g5_districts),
+                    "start_date": range5[0].isoformat(),
+                    "end_date": range5[1].isoformat(),
+                }
+            st.session_state["g5_payload"] = fetch_graph(
+                "/api/graphs/district-retail",
+                g5_params,
+            )
+            st.session_state["g5_error"] = None
+        except Exception as exc:
+            st.session_state["g5_error"] = str(exc)
+if st.session_state.get("g5_error"):
+    st.error(st.session_state["g5_error"])
+payload5 = st.session_state.get("g5_payload") if g5_districts else None
+if not g5_districts:
+    st.info("Select one or two districts to see the daily retail outlook.")
+elif not payload5:
+    st.info("Select up to two districts and click Update district outlook.")
+else:
+    last_obs5 = payload5.get("last_observation_date")
+    st.caption(
+        f"Latest actual data: {last_obs5 or 'unknown'}  ·  Forecast: "
+        f"{payload5.get('forecast_start_date')} → {payload5.get('forecast_end_date')}  ·  "
+        f"Districts: {', '.join(payload5.get('selected_districts', []))}"
+    )
+    for warning in payload5.get("warnings", []):
+        st.warning(warning)
+    history5 = pd.DataFrame(payload5.get("historical", []))
+    forecast5 = pd.DataFrame(payload5.get("forecast", []))
+    selected5 = payload5.get("selected_districts", [])
+    district_colors5 = {
+        district: qualitative.Plotly[idx % len(qualitative.Plotly)]
+        for idx, district in enumerate(selected5)
+    }
+
+    with st.expander("District forecast details"):
+        st.json({
+            "selected_districts": selected5,
+            "supported_districts": payload5.get("supported_districts", []),
+            "data_sources": payload5.get("data_sources", {}),
+            "frequency": "daily",
+            "last_observation_date": last_obs5,
+        })
+
+    st.markdown("#### District retail prices: actuals and forecast")
+    st.caption("Circles show daily actuals · Dashed diamonds show forecast medians · Shading shows the P10–P90 range when the forecast includes one.")
+    fig5 = go.Figure()
+    for district in selected5:
+        color = district_colors5[district]
+        actual5 = (
+            history5[history5["district"] == district].sort_values("date")
+            if not history5.empty and "district" in history5 else pd.DataFrame()
+        )
+        fc5 = (
+            forecast5[forecast5["district"] == district].sort_values("date")
+            if not forecast5.empty and "district" in forecast5 else pd.DataFrame()
+        )
+        if not fc5.empty and {"p10_rs_kg", "p90_rs_kg"} <= set(fc5.columns):
+            spread5 = (fc5["p90_rs_kg"] - fc5["p10_rs_kg"]).abs()
+            if (spread5 > 1e-9).any():
+                add_forecast_band(
+                    fig5, fc5["date"], fc5["p10_rs_kg"], fc5["p90_rs_kg"],
+                    color, f"{district} · P10–P90", district,
+                )
+        if not actual5.empty:
+            fig5.add_trace(go.Scatter(
+                x=actual5["date"], y=actual5["actual_price_rs_kg"],
+                mode="lines+markers", name=f"{district} · actual",
+                line={"color": color, "width": 2.2},
+                marker={"color": color, "size": 5, "symbol": "circle"},
+                legendgroup=district,
+                hovertemplate="%{x}<br>Actual: ₹%{y:.2f}/kg<extra></extra>",
+            ))
+        if not fc5.empty:
+            fig5.add_trace(go.Scatter(
+                x=fc5["date"], y=fc5["predicted_price_rs_kg"],
+                mode="lines+markers", name=f"{district} · forecast P50",
+                line={"color": color, "width": 2.5, "dash": "dash"},
+                marker={"color": color, "size": 8, "symbol": "diamond"},
+                legendgroup=district,
+                hovertemplate="%{x}<br>Forecast: ₹%{y:.2f}/kg<extra></extra>",
+            ))
+    if payload5.get("forecast_start_date"):
+        fig5.add_vline(
+            x=payload5["forecast_start_date"], line_dash="dot",
+            line_color="#8d96a5", opacity=.7,
+            annotation_text="Forecast starts", annotation_position="top left",
+        )
+    configure_chart(fig5, y_title="Price (₹/kg)", height=430)
+    st.plotly_chart(fig5, use_container_width=True)
+
+    metric_cols5 = st.columns(max(len(selected5) * 2, 1))
+    idx5 = 0
+    for district in selected5:
+        actual5 = (
+            history5[history5["district"] == district].sort_values("date")
+            if not history5.empty and "district" in history5 else pd.DataFrame()
+        )
+        fc5 = (
+            forecast5[forecast5["district"] == district].sort_values("date")
+            if not forecast5.empty and "district" in forecast5 else pd.DataFrame()
+        )
+        if not actual5.empty:
+            metric_cols5[idx5].metric(
+                f"{district} · latest actual",
+                f"₹{actual5.iloc[-1]['actual_price_rs_kg']:,.2f}/kg",
+                help=f"Latest observed price: {actual5.iloc[-1]['date']}",
+            )
+            idx5 += 1
+        if not fc5.empty:
+            metric_cols5[idx5].metric(
+                f"{district} · first forecast",
+                f"₹{fc5.iloc[0]['predicted_price_rs_kg']:,.2f}/kg",
+                help=f"First forecast date: {fc5.iloc[0]['date']}",
+            )
+            idx5 += 1
+
+    summary5 = payload5.get("change_summary", []) or []
+    if summary5:
+        st.markdown("#### Change from last observed price")
+        st.caption(
+            "Percentage compares the most recently observed price with the "
+            "forecasted price on the last forecasted date of the selected horizon."
+        )
+        sum_cols5 = st.columns(len(summary5))
+        for column, summary in zip(sum_cols5, summary5):
+            percent = summary.get("change_percent")
+            delta = None if percent is None else f"{percent:+.2f}%"
+            column.metric(
+                f"{summary['district']} · change by {summary['final_forecast_date']}",
+                f"₹{summary['final_forecast_price_rs_kg']:,.2f}/kg",
+                delta=delta,
+                help=(f"Latest observed ₹{summary['latest_actual_price_rs_kg']:,.2f}/kg "
+                      f"on {summary['latest_actual_date']} → "
+                      f"{summary['change_direction']}"),
+            )
+
+    combined5 = pd.concat(
+        [
+            history5.assign(kind="actual") if not history5.empty else pd.DataFrame(),
+            forecast5.assign(kind="forecast") if not forecast5.empty else pd.DataFrame(),
+        ],
+        ignore_index=True,
+    )
+    combined5 = combined5.reindex(columns=[
+        column for column in
+        ("date", "district", "actual_price_rs_kg", "predicted_price_rs_kg", "kind")
+        if column in combined5.columns
+    ])
+    if not combined5.empty:
+        st.download_button(
+            "Download district price data CSV", combined5.to_csv(index=False),
+            file_name="district_retail_prices.csv", mime="text/csv",
+            key="g5_district_download",
+        )
+
 st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
 st.caption("Visual QA dashboard. The production frontend should call the same FastAPI endpoints. Weather / El Niño / cyclone scenarios are intentionally not included yet.")
 

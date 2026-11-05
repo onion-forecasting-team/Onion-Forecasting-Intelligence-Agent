@@ -39,6 +39,7 @@ from history_store import (
     save_forecast_run, sync_model_ready_csv,
 )
 import history_store  # for store_label() (MongoDB store identity in /health)
+from db_client import get_db  # direct read-only access for district collections
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(ROOT / "config" / ".env")
@@ -780,7 +781,8 @@ def root() -> dict:
             "graphs": {"graph_1_ap_prices": "/api/graphs/ap-retail",
                        "graph_2_state_comparison": "/api/graphs/state-comparison",
                        "graph_3_supply_balance": "/api/graphs/supply-balance",
-                       "graph_4_monthly_retail": "/api/graphs/monthly-retail"},
+                       "graph_4_monthly_retail": "/api/graphs/monthly-retail",
+                       "graph_5_district_retail": "/api/graphs/district-retail"},
             "ops": {"health": "/health", "ingestion_status": "/api/ingestion/status", "saved_forecasts": "/api/forecasts/latest"}}
 
 
@@ -1510,6 +1512,235 @@ def monthly_retail_graph(
         **status,
         "forecast_end_date": max(
             (row["date"] for row in (forecast_rows + price_forecast_rows)), default=None),
+    }
+
+
+@app.get("/api/graphs/district-retail")
+def district_retail_graph(
+    districts: str = Query(
+        ...,
+        description="Comma-separated district names (1 or 2), e.g. Chittoor,Ananthapuramu",
+    ),
+    start_date: date | None = Query(
+        None,
+        description="First date to display, YYYY-MM-DD; defaults to the earliest historical observation",
+    ),
+    end_date: date | None = Query(
+        None,
+        description="Last date to display and forecast through, YYYY-MM-DD; defaults to the last available forecast date",
+    ),
+    horizon_days: int | None = Query(
+        None,
+        ge=1,
+        le=180,
+        description=("Forecast horizon in days counted from the last historical "
+                     "observation (7 = 7-day forecast, 14 = 14-day, 30 = 1 month, "
+                     "60 = 2 months, 180 = 6 months). Mutually exclusive with "
+                     "end_date; it replaces the requested end date."),
+    ),
+) -> dict:
+    end_date_explicit = end_date is not None
+    db = get_db()
+    forecast_docs = list(
+        db["forecast_district_wise_data"].find({}, {"_id": 0}).sort("Date", 1))
+    if not forecast_docs:
+        raise HTTPException(status_code=500,
+                            detail="forecast_district_wise_data is empty.")
+    supported = sorted(
+        key for key in forecast_docs[0]
+        if key not in ("Date", "Y"))
+
+    requested = [part.strip() for part in districts.split(",") if part.strip()]
+    if not 1 <= len(requested) <= 2:
+        raise HTTPException(
+            status_code=422,
+            detail="Select one or two districts.",
+        )
+    districts_lower = {name.lower(): name for name in supported}
+    resolved: list[str] = []
+    unknown: list[str] = []
+    for name in requested:
+        matched = districts_lower.get(name.lower())
+        if matched is None:
+            unknown.append(name)
+        elif matched not in resolved:
+            resolved.append(matched)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported districts: {unknown}. Allowed: {supported}",
+        )
+
+    def _doc_date(value: object) -> date:
+        return date.fromisoformat(str(value)[:10])
+
+    if horizon_days is not None and end_date_explicit:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either horizon_days or end_date, not both.",
+        )
+
+    last_history = list(
+        db["district_wise_data"].find({}, {"Date": 1, "_id": 0}).sort("Date", -1).limit(1))
+    last_date = _doc_date(last_history[0]["Date"]) if last_history else None
+
+    if start_date is None:
+        history_sample = list(
+            db["district_wise_data"].find({}, {"Date": 1, "_id": 0}).sort("Date", 1).limit(1))
+        start_date = _doc_date(history_sample[0]["Date"]) if history_sample else _doc_date(forecast_docs[0]["Date"])
+    if horizon_days is not None:
+        if last_date is None:
+            raise HTTPException(
+                status_code=422,
+                detail="horizon_days requires historical observations to anchor the horizon.",
+            )
+        end_date = last_date + timedelta(days=horizon_days)
+    elif end_date is None:
+        end_date = _doc_date(forecast_docs[-1]["Date"])
+    if start_date > end_date:
+        raise HTTPException(status_code=422, detail="start_date must be on or before end_date.")
+
+    # Price on the most recent historical date per district; the base of the
+    # horizon change summary (last historic date -> last forecasted price).
+    latest_actual: dict[str, dict] = {}
+    pending = list(resolved)
+    recent_docs = list(
+        db["district_wise_data"].find({}, {"_id": 0}).sort("Date", -1).limit(10))
+    for doc in recent_docs:
+        if not pending:
+            break
+        try:
+            stamp = _doc_date(doc["Date"])
+        except Exception:
+            continue
+        for district in list(pending):
+            value = doc.get(district)
+            if value is None:
+                continue
+            try:
+                price = round(float(value), 4)
+            except (TypeError, ValueError):
+                continue
+            latest_actual[district] = {"date": stamp.isoformat(), "price": price}
+            pending.remove(district)
+
+    historical: list[dict] = []
+    forecast: list[dict] = []
+    for doc in db["district_wise_data"].find({}, {"_id": 0}).sort("Date", 1):
+        try:
+            stamp = _doc_date(doc["Date"])
+        except Exception:
+            continue
+        if not (start_date <= stamp <= end_date):
+            continue
+        for district in resolved:
+            value = doc.get(district)
+            if value is None:
+                continue
+            historical.append({
+                "date": stamp.isoformat(),
+                "district": district,
+                "actual_price_rs_kg": round(float(value), 4),
+                "unit": "INR/kg",
+            })
+
+    for doc in forecast_docs:
+        stamp = _doc_date(doc["Date"])
+        if not (start_date <= stamp <= end_date):
+            continue
+        for district in resolved:
+            value = doc.get(district)
+            if value is None:
+                continue
+            price = round(float(value), 4)
+            forecast.append({
+                "date": stamp.isoformat(),
+                "district": district,
+                "predicted_price_rs_kg": price,
+                "p10_rs_kg": price,
+                "p50_rs_kg": price,
+                "p90_rs_kg": price,
+                "unit": "INR/kg",
+            })
+
+    # Horizon change summary: last historic price -> last forecasted price in
+    # the selected window, per district (e.g. 7-day / 14-day / 1m / 2m / 6m).
+    change_summary: list[dict] = []
+    for district in resolved:
+        base = latest_actual.get(district)
+        rows = [row for row in forecast if row["district"] == district]
+        if not base or not rows:
+            continue
+        final_row = rows[-1]
+        latest_price = base["price"]
+        final_price = final_row["predicted_price_rs_kg"]
+        change = final_price - latest_price
+        percent = (change / latest_price * 100.0) if latest_price else None
+        change_summary.append({
+            "district": district,
+            "latest_actual_date": base["date"],
+            "latest_actual_price_rs_kg": latest_price,
+            "final_forecast_date": final_row["date"],
+            "final_forecast_price_rs_kg": final_price,
+            "change_rs_kg": round(change, 2),
+            "change_percent": round(percent, 2) if percent is not None else None,
+            "change_direction": ("increase" if change > 0
+                                 else "decrease" if change < 0 else "unchanged"),
+            "unit": "INR/kg",
+        })
+
+    db_values = [{
+        "state_code": row["district"], "target_key": "retail",
+        "forecast_date": row["date"],
+        "p10": row["p10_rs_kg"],
+        "p50": row["p50_rs_kg"],
+        "p90": row["p90_rs_kg"],
+        "unit": "INR/kg",
+    } for row in forecast]
+    saved = (
+        save_forecast_run(
+            "graph5_district_retail",
+            0,
+            last_date.isoformat() if last_date else None,
+            "district_two_selection",
+            db_values,
+            MODEL_ID,
+            {"source": "forecast_district_wise_data", "frequency": "daily",
+             "unit": "INR/kg"},
+        )
+        if db_values else None
+    )
+
+    status = {
+        "last_observation_date": last_date.isoformat() if last_date else None,
+        "data_staleness_days": ((date.today() - last_date).days if last_date else None),
+    }
+    warnings: list[str] = []
+    if last_date and end_date and last_date < end_date:
+        warnings.append(
+            f"Historical observations end at {last_date.isoformat()}; the range "
+            f"through {end_date.isoformat()} is completed with precomputed "
+            "district forecasts.")
+    return {
+        "graph": "district_retail_forecast",
+        "title": "District Retail Onion Price Forecast",
+        "selected_districts": resolved,
+        "supported_districts": supported,
+        "historical": historical,
+        "forecast": forecast,
+        "change_summary": change_summary,
+        "horizon_days": horizon_days,
+        "unit": "INR/kg",
+        "metadata": _metadata(),
+        **status,
+        "visible_start_date": start_date.isoformat(),
+        "visible_end_date": end_date.isoformat(),
+        "forecast_start_date": min((r["date"] for r in forecast), default=None),
+        "forecast_end_date": max((r["date"] for r in forecast), default=None),
+        "data_sources": {"historical": "district_wise_data",
+                         "forecast": "forecast_district_wise_data"},
+        "saved_to_sqlite": saved,
+        "warnings": warnings,
     }
 
 
