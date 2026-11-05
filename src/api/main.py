@@ -1529,7 +1529,17 @@ def district_retail_graph(
         None,
         description="Last date to display and forecast through, YYYY-MM-DD; defaults to the last available forecast date",
     ),
+    horizon_days: int | None = Query(
+        None,
+        ge=1,
+        le=180,
+        description=("Forecast horizon in days counted from the last historical "
+                     "observation (7 = 7-day forecast, 14 = 14-day, 30 = 1 month, "
+                     "60 = 2 months, 180 = 6 months). Mutually exclusive with "
+                     "end_date; it replaces the requested end date."),
+    ),
 ) -> dict:
+    end_date_explicit = end_date is not None
     db = get_db()
     forecast_docs = list(
         db["forecast_district_wise_data"].find({}, {"_id": 0}).sort("Date", 1))
@@ -1564,14 +1574,55 @@ def district_retail_graph(
     def _doc_date(value: object) -> date:
         return date.fromisoformat(str(value)[:10])
 
+    if horizon_days is not None and end_date_explicit:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either horizon_days or end_date, not both.",
+        )
+
+    last_history = list(
+        db["district_wise_data"].find({}, {"Date": 1, "_id": 0}).sort("Date", -1).limit(1))
+    last_date = _doc_date(last_history[0]["Date"]) if last_history else None
+
     if start_date is None:
         history_sample = list(
             db["district_wise_data"].find({}, {"Date": 1, "_id": 0}).sort("Date", 1).limit(1))
         start_date = _doc_date(history_sample[0]["Date"]) if history_sample else _doc_date(forecast_docs[0]["Date"])
-    if end_date is None:
+    if horizon_days is not None:
+        if last_date is None:
+            raise HTTPException(
+                status_code=422,
+                detail="horizon_days requires historical observations to anchor the horizon.",
+            )
+        end_date = last_date + timedelta(days=horizon_days)
+    elif end_date is None:
         end_date = _doc_date(forecast_docs[-1]["Date"])
     if start_date > end_date:
         raise HTTPException(status_code=422, detail="start_date must be on or before end_date.")
+
+    # Price on the most recent historical date per district; the base of the
+    # horizon change summary (last historic date -> last forecasted price).
+    latest_actual: dict[str, dict] = {}
+    pending = list(resolved)
+    recent_docs = list(
+        db["district_wise_data"].find({}, {"_id": 0}).sort("Date", -1).limit(10))
+    for doc in recent_docs:
+        if not pending:
+            break
+        try:
+            stamp = _doc_date(doc["Date"])
+        except Exception:
+            continue
+        for district in list(pending):
+            value = doc.get(district)
+            if value is None:
+                continue
+            try:
+                price = round(float(value), 4)
+            except (TypeError, ValueError):
+                continue
+            latest_actual[district] = {"date": stamp.isoformat(), "price": price}
+            pending.remove(district)
 
     historical: list[dict] = []
     forecast: list[dict] = []
@@ -1612,9 +1663,31 @@ def district_retail_graph(
                 "unit": "INR/kg",
             })
 
-    last_history = list(
-        db["district_wise_data"].find({}, {"Date": 1, "_id": 0}).sort("Date", -1).limit(1))
-    last_date = _doc_date(last_history[0]["Date"]) if last_history else None
+    # Horizon change summary: last historic price -> last forecasted price in
+    # the selected window, per district (e.g. 7-day / 14-day / 1m / 2m / 6m).
+    change_summary: list[dict] = []
+    for district in resolved:
+        base = latest_actual.get(district)
+        rows = [row for row in forecast if row["district"] == district]
+        if not base or not rows:
+            continue
+        final_row = rows[-1]
+        latest_price = base["price"]
+        final_price = final_row["predicted_price_rs_kg"]
+        change = final_price - latest_price
+        percent = (change / latest_price * 100.0) if latest_price else None
+        change_summary.append({
+            "district": district,
+            "latest_actual_date": base["date"],
+            "latest_actual_price_rs_kg": latest_price,
+            "final_forecast_date": final_row["date"],
+            "final_forecast_price_rs_kg": final_price,
+            "change_rs_kg": round(change, 2),
+            "change_percent": round(percent, 2) if percent is not None else None,
+            "change_direction": ("increase" if change > 0
+                                 else "decrease" if change < 0 else "unchanged"),
+            "unit": "INR/kg",
+        })
 
     db_values = [{
         "state_code": row["district"], "target_key": "retail",
@@ -1655,6 +1728,8 @@ def district_retail_graph(
         "supported_districts": supported,
         "historical": historical,
         "forecast": forecast,
+        "change_summary": change_summary,
+        "horizon_days": horizon_days,
         "unit": "INR/kg",
         "metadata": _metadata(),
         **status,

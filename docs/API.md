@@ -637,17 +637,25 @@ re-run if the raw CSVs are ever re-ingested via a dotted column name).
 | `districts` | string | **Yes** | — | Comma-separated list of 1 or 2 district names from the list above (case-insensitive; duplicates ignored). |
 | `start_date` | date | No | Earliest historical observation (2020-01-01) | First date to display, `YYYY-MM-DD`. |
 | `end_date` | date | No | Last available forecast date (2027-05-02) | Last date to display and forecast through, `YYYY-MM-DD`. Must be on or after `start_date`. |
+| `horizon_days` | integer | No | — | Forecast horizon in days counted from `last_observation_date` (`7` = 7-day, `14` = 14-day, `30` = 1 month, `60` = 2 months, `180` = 6 months). Range `1`–`180`. Mutually exclusive with `end_date` (HTTP 422 when both are given); it replaces the requested `end_date`. |
 
 #### Behavior:
 - Historical dates span 2020-01-01 through the latest daily observation (e.g. 2026-11-03); forecast dates span the day after the last observation through 180 days ahead (e.g. 2026-11-04 → 2027-05-02). Rows are only returned inside the inclusive requested range.
 - Null/missing district cells are skipped; the nested `"Y"` helper field in the collections is ignored.
 - Historical rows carry `actual_price_rs_kg`; forecast rows carry `predicted_price_rs_kg`. `p10_rs_kg`, `p50_rs_kg`, and `p90_rs_kg` all equal the predicted value because the forecast dataset stores a single point value per district and day; no interval is produced on the request path.
+- **Horizon & percentage change**: with `horizon_days` (or an explicit `end_date`), each response includes a `change_summary` list with one entry per selected district: the price on the district's last historical observation (`latest_actual_date` / `latest_actual_price_rs_kg`, the last historic date) versus the forecasted price on the final forecast date within the requested window (`final_forecast_date` / `final_forecast_price_rs_kg`), plus `change_rs_kg`, `change_percent` (e.g. `-2.31` = −2.31%), and `change_direction` (`increase`, `decrease`, or `unchanged`). So a 7-day request compares the last observed price with the 7-day-ahead forecasted price; the requested horizons map directly (7d/14d/1m/2m/6m → `horizon_days` 7/14/30/60/180). The echoed `horizon_days` field is `null` when `end_date` (or the default end date) is used instead.
 - A warning is included when historical observations end inside the requested window and precomputed forecasts complete the range.
-- HTTP 422 for: more than two districts ("Select one or two districts."), unknown district names (includes the allowed list), or `start_date` after `end_date`.
+- HTTP 422 for: more than two districts ("Select one or two districts."), unknown district names (includes the allowed list), `start_date` after `end_date`, providing both `horizon_days` and `end_date` ("Provide either horizon_days or end_date, not both."), or `horizon_days` outside `1`–`180`.
 
 #### Example Request:
 ```http
 GET /api/graphs/district-retail?districts=Chittoor&start_date=2026-10-01&end_date=2026-11-30
+```
+
+Example — 7-day forecast horizon (last observation + 7 days, i.e. 2026-11-04 → 2026-11-10):
+
+```http
+GET /api/graphs/district-retail?districts=Chittoor&horizon_days=7
 ```
 
 #### Sample Output:
@@ -676,6 +684,20 @@ GET /api/graphs/district-retail?districts=Chittoor&start_date=2026-10-01&end_dat
       "unit": "INR/kg"
     }
   ],
+  "change_summary": [
+    {
+      "district": "Chittoor",
+      "latest_actual_date": "2026-11-03",
+      "latest_actual_price_rs_kg": 35.0,
+      "final_forecast_date": "2026-11-30",
+      "final_forecast_price_rs_kg": 33.1748,
+      "change_rs_kg": -1.83,
+      "change_percent": -5.21,
+      "change_direction": "decrease",
+      "unit": "INR/kg"
+    }
+  ],
+  "horizon_days": null,
   "unit": "INR/kg",
   "metadata": {
     "model": "amazon/chronos-2",
@@ -726,6 +748,32 @@ repeated per requested district (`district` field) for every date in range. Beca
 the forecast is served from precomputed data, `forecast_start_date` is the first
 precomputed forecast date within the requested window (the day after
 `last_observation_date`), not "today".
+
+With a horizon request (`horizon_days=7`), the window ends at `last_observation_date + 7`
+(`visible_end_date: "2026-11-10"`), the echoed field is `"horizon_days": 7`, and the
+entry becomes:
+
+```json
+{
+  "change_summary": [
+    {
+      "district": "Chittoor",
+      "latest_actual_date": "2026-11-03",
+      "latest_actual_price_rs_kg": 35.0,
+      "final_forecast_date": "2026-11-10",
+      "final_forecast_price_rs_kg": 34.1922,
+      "change_rs_kg": -0.81,
+      "change_percent": -2.31,
+      "change_direction": "decrease",
+      "unit": "INR/kg"
+    }
+  ]
+}
+```
+
+The same `change_summary` is populated for `end_date` requests (change measured to the
+last forecast date inside the window) — the sample above is end-date based, which is
+why its `horizon_days` is `null`.
 
 ---
 

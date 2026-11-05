@@ -923,25 +923,57 @@ g5_districts = st.multiselect(
     key="g5_districts",
     help="Only districts present in the forecast dataset can be selected.",
 )
-range5 = date_range_control(
-    "g5_district_date_range",
-    "District date range",
-    start_days_before=90,
-    end_days_after=180,
+g5_horizons = {
+    "7 days": 7,
+    "14 days": 14,
+    "1 month": 30,
+    "2 months": 60,
+    "6 months": 180,
+    "Custom date range": None,
+}
+# Days of history shown before the last observation for each fixed horizon.
+g5_horizon_history_days = {
+    "7 days": 30, "14 days": 30, "1 month": 60, "2 months": 60, "6 months": 90,
+}
+g5_horizon = st.selectbox(
+    "Forecast horizon",
+    options=list(g5_horizons),
+    key="g5_horizon",
+    help=("Percentage change compares the last observed price with the forecasted "
+          "price at the end of this horizon."),
 )
+horizon_days5 = g5_horizons[g5_horizon]
+range5 = None
+if horizon_days5 is None:
+    range5 = date_range_control(
+        "g5_district_date_range",
+        "District date range",
+        start_days_before=90,
+        end_days_after=180,
+    )
 run5 = st.button("Update district outlook", type="primary", key="g5_run")
 if run5:
     st.session_state["g5_started"] = True
-if g5_districts and range5 and (run5 or st.session_state.get("g5_started", False)):
+if g5_districts and (horizon_days5 is not None or range5) and (
+        run5 or st.session_state.get("g5_started", False)):
     with st.spinner("Loading district retail prices and forecasts..."):
         try:
-            st.session_state["g5_payload"] = fetch_graph(
-                "/api/graphs/district-retail",
-                {
+            if horizon_days5 is not None:
+                start_back = g5_horizon_history_days[g5_horizon]
+                g5_params = {
+                    "districts": ",".join(g5_districts),
+                    "horizon_days": horizon_days5,
+                    "start_date": (date.today() - timedelta(days=start_back)).isoformat(),
+                }
+            else:
+                g5_params = {
                     "districts": ",".join(g5_districts),
                     "start_date": range5[0].isoformat(),
                     "end_date": range5[1].isoformat(),
-                },
+                }
+            st.session_state["g5_payload"] = fetch_graph(
+                "/api/graphs/district-retail",
+                g5_params,
             )
             st.session_state["g5_error"] = None
         except Exception as exc:
@@ -1051,6 +1083,26 @@ else:
                 help=f"First forecast date: {fc5.iloc[0]['date']}",
             )
             idx5 += 1
+
+    summary5 = payload5.get("change_summary", []) or []
+    if summary5:
+        st.markdown("#### Change from last observed price")
+        st.caption(
+            "Percentage compares the most recently observed price with the "
+            "forecasted price on the last forecasted date of the selected horizon."
+        )
+        sum_cols5 = st.columns(len(summary5))
+        for column, summary in zip(sum_cols5, summary5):
+            percent = summary.get("change_percent")
+            delta = None if percent is None else f"{percent:+.2f}%"
+            column.metric(
+                f"{summary['district']} · change by {summary['final_forecast_date']}",
+                f"₹{summary['final_forecast_price_rs_kg']:,.2f}/kg",
+                delta=delta,
+                help=(f"Latest observed ₹{summary['latest_actual_price_rs_kg']:,.2f}/kg "
+                      f"on {summary['latest_actual_date']} → "
+                      f"{summary['change_direction']}"),
+            )
 
     combined5 = pd.concat(
         [
