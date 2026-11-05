@@ -467,23 +467,39 @@ def sync_daily_price_csv_from_graph(dates: Iterable[str]) -> dict[str, int]:
 
 
 def load_ap_monthly_history() -> pd.DataFrame:
-    # Prefer the MongoDB "Monthly retail" collection when it exists so the API
-    # uses MongoDB as its runtime source of monthly observations.
+    """Load monthly AP observations, preferring MongoDB datasets over CSV.
+
+    Source order:
+    1. MongoDB ``Monthly retail`` collection (monthly retail price dataset).
+    2. MongoDB ``ap_monthly_observations`` (existing monthly graph dataset).
+    3. Configured CSV, which is synchronized into ``ap_monthly_observations``
+       when neither MongoDB dataset has rows.
+    """
+    db = get_db()
+
+    monthly_retail_docs = []
     try:
-        db = get_db()
-        docs = list(db["Monthly retail"].find({}, {"_id": 0}))
+        monthly_retail_docs = list(db["Monthly retail"].find({}, {"_id": 0}))
     except Exception:
-        docs = []
-    if docs:
-        frame = normalize_ap_monthly_frame(pd.DataFrame(docs))
+        monthly_retail_docs = []
+    if monthly_retail_docs:
+        frame = normalize_ap_monthly_frame(pd.DataFrame(monthly_retail_docs))
         if "month_start" in frame.columns:
             frame["month_start"] = pd.to_datetime(frame["month_start"])
         return frame
+
+    stored = pd.DataFrame(list(
+        db["ap_monthly_observations"].find({}, {"_id": 0}).sort("month_start", 1)))
+    if stored.shape[0] and "month_start" in stored.columns:
+        stored["month_start"] = pd.to_datetime(stored["month_start"])
+        return normalize_ap_monthly_frame(stored)
 
     if not AP_MONTHLY_CSV_PATH.exists():
         raise FileNotFoundError(f"Monthly AP dataset not found: {AP_MONTHLY_CSV_PATH}")
     frame = normalize_ap_monthly_frame(
         pd.read_csv(AP_MONTHLY_CSV_PATH, encoding="utf-8-sig"))
+    _sync_graph_dataset("ap_monthly", AP_MONTHLY_CSV_PATH,
+                        "ap_monthly_observations", frame, "month_start")
     return frame
 
 

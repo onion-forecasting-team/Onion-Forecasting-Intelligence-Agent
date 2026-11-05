@@ -19,6 +19,8 @@ This document covers all API endpoints, parameters, request headers, service log
   - Historical prices returned in graphs: ₹ / kg (converted for direct comparison with forecasts)
   - Graph 1/2 daily arrivals: Metric quintals / day in model context
   - Graph 3 AP production, consumption, arrivals, and shortfall: Tonnes / month
+  - Graph 4 monthly AP quantities: Tonnes / month; monthly retail price forecast: ₹ / kg (no ×100 conversion)
+  - Graph 5 district retail prices, historical and forecast: ₹ / kg
 - **Precompute knobs** (`config/.env`): `PRECOMPUTE_SCHEDULER_ENABLED` (default `1`), `PRECOMPUTE_HORIZON_DAYS` (`180`, capped at the API 180-day limit), `PRECOMPUTE_REFRESH_DAYS` (`5`), `PRECOMPUTE_CHECK_INTERVAL_MIN` (`15`).
 
 Protected data and forecast routes require `Authorization: Bearer <API_BEARER_TOKEN>`.
@@ -62,12 +64,15 @@ These endpoints serve Chronos-2 predictions backed by MongoDB. Graphs 1 and 2 ar
 
 Graphs 1–3 require `start_date` and `end_date` in `YYYY-MM-DD` format. Graph 4
 requires `start_date`; `end_date` is optional and defaults to 180 days after the
-latest monthly observation.
+latest monthly observation. Graph 5 requires `districts`; both dates are optional
+(`start_date` defaults to the earliest historical district observation,
+`end_date` to the last precomputed district forecast date).
 Actual observations and forecast records are returned only inside this inclusive date
 range. Graphs 1 and 2 use daily data and forecast from the day after the latest
 observation. Graph 3 uses monthly AP data and forecasts month-start periods through the
-month containing `end_date`. The existing 180-day request limit is retained for all
-graphs. `horizon_days` remains the calendar-day distance from the latest source date to
+month containing `end_date`. The existing 180-day request limit is retained for
+Graphs 1–4; Graph 5 serves precomputed daily district rows and is not subject to
+that cap. `horizon_days` remains the calendar-day distance from the latest source date to
 the requested end date, capped at 180. If `end_date` exceeds the supported horizon, the
 API forecasts through the latest supported date and returns a successful, partial-range
 response rather than rejecting the request. Graph 3 forecasts month-start periods through
@@ -454,7 +459,10 @@ GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-
 
 - **Method**: `GET`
 - **Path**: `/api/graphs/monthly-retail`
-- **Source**: Reads MongoDB collection `Monthly retail` directly. This endpoint does not sync from a CSV or read `ap_monthly_observations`.
+- **Source**: MongoDB-first: prefers collection `Monthly retail` (normalized monthly
+  dataset with `AP_avg_*` price fields); when that collection is empty it falls back to
+  `ap_monthly_observations`, and finally to the configured monthly CSV, which is then
+  synchronized into `ap_monthly_observations`.
 
 #### Query Parameters:
 | Parameter | Type | Required | Default | Description |
@@ -462,23 +470,262 @@ GET /api/graphs/supply-balance?states=AP&start_date=2026-10-01&end_date=2026-11-
 | `states` | string | No | `AP` | AP only. |
 | `start_date` | date | Yes | — | First date to include, `YYYY-MM-DD`. |
 | `end_date` | date | No | Latest monthly observation + 180 days | Requested final date, `YYYY-MM-DD`. |
-| `features` | string | No | `wholesale,mandi` | Comma-separated context inputs: `wholesale`, `mandi`, `arrival`, `production`, and/or `consumption`. Retail is the forecast target. |
+| `features` | string | No | `wholesale,mandi` | Comma-separated context inputs: `wholesale`, `mandi`, `arrival`, `production`, and/or `consumption`. Retail is the forecast target. An unknown feature name returns HTTP 422 with the allowed list. |
 
 The collection's `AP_avg_retail_price_rs_kg`, `AP_avg_wholesale_price_rs_kg`, and
-`AP_avg_mandi_modal_rs_kg` fields are normalized for forecasting. The response
-includes the retail forecast in `price_forecast`, monthly quantity forecasts in
-`quantity_forecast`, and the supply-demand balance in `balance_forecast`.
+`AP_avg_mandi_modal_rs_kg` fields are normalized for forecasting to the canonical
+`retail_price_rs_kg`, `wholesale_price_rs_kg`, and `mandi_price_rs_kg` columns.
+
+Feature names map to canonical columns:
+
+| Feature | Canonical column |
+|---|---|
+| `retail` | `retail_price_rs_kg` (forecast target's own history) |
+| `wholesale` | `wholesale_price_rs_kg` |
+| `mandi` | `mandi_price_rs_kg` |
+| `arrival` | `arrival_t_month` |
+| `production` | `production_t_month` |
+| `consumption` | `consumption_t_month` |
+
+Monthly forecasts run at month-start frequency. Quantities stay in tonnes/month and
+retail prices stay in ₹/kg (no ×100 conversion). The response includes the retail
+forecast in `price_forecast` (mirrored as `retail_forecast`), monthly quantity
+forecasts in `quantity_forecast`, the supply-demand balance in `balance_forecast`,
+the selected context in `selected_features` / `context_logic`, and a
+`forecast_overall_confidence` block marked `available: false` (daily tolerance-band
+confidence applies to Graphs 1/2 only).
 
 #### Example Request:
 ```http
-GET /api/graphs/monthly-retail?states=AP&start_date=2026-10-01&features=wholesale%2Cmandi%2Carrival
+GET /api/graphs/monthly-retail?states=AP&start_date=2026-09-01&end_date=2026-12-01&features=wholesale%2Cmandi%2Carrival
 ```
+
+#### Sample Output:
+```json
+{
+  "graph": "monthly_retail_forecast",
+  "title": "Andhra Pradesh Monthly Supply and Retail Price Forecast",
+  "selected_states": ["AP"],
+  "selected_state_names": ["Andhra Pradesh"],
+  "selected_features": ["wholesale", "mandi", "arrival"],
+  "context_logic": {
+    "wholesale": "wholesale_price_rs_kg",
+    "mandi": "mandi_price_rs_kg",
+    "arrival": "arrival_t_month"
+  },
+  "horizon_days": 61,
+  "price_unit": "INR/kg",
+  "quantity_unit": "tonnes/month",
+  "requested_end_date": "2026-12-01",
+  "forecast_limit_date": "2026-12-01",
+  "forecast_truncated": false,
+  "historical": [
+    {
+      "date": "2026-09-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "production",
+      "actual_quantity_tonnes_month": 50880.0,
+      "actual_quantity_mq_day": 50880.0,
+      "unit": "tonnes/month"
+    }
+  ],
+  "quantity_forecast": [
+    {
+      "date": "2026-11-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "production",
+      "predicted_quantity_tonnes_month": 37864.9688,
+      "p10_tonnes_month": 23749.332,
+      "p50_tonnes_month": 37864.9688,
+      "p90_tonnes_month": 51016.1094,
+      "predicted_quantity_mq_day": 37864.9688,
+      "p10_mq_day": 23749.332,
+      "p50_mq_day": 37864.9688,
+      "p90_mq_day": 51016.1094,
+      "unit": "tonnes/month"
+    }
+  ],
+  "balance_forecast": [
+    {
+      "date": "2026-11-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "shortfall_p10_tonnes_month": 7090.5117,
+      "shortfall_p50_tonnes_month": 27810.0385,
+      "shortfall_p90_tonnes_month": 48130.587,
+      "shortfall_p10_metric_quintal_day": 7090.5117,
+      "shortfall_p50_metric_quintal_day": 27810.0385,
+      "shortfall_p90_metric_quintal_day": 48130.587,
+      "classification": "potential_shortfall"
+    }
+  ],
+  "price_forecast": [
+    {
+      "date": "2026-11-01",
+      "state": "AP",
+      "state_name": "Andhra Pradesh",
+      "metric": "retail",
+      "predicted_price_rs_kg": 53.6662,
+      "p10_rs_kg": 50.1921,
+      "p50_rs_kg": 53.6662,
+      "p90_rs_kg": 57.3078,
+      "unit": "INR/kg"
+    }
+  ],
+  "balance_formula": "consumption - (arrival + production)",
+  "metadata": {
+    "model": "amazon/chronos-2",
+    "frequency": "monthly",
+    "observation_price_unit": "INR/metric quintal",
+    "forecast_price_unit": "INR/kg",
+    "quantity_unit": "tonnes/month",
+    "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
+    "prediction_interval": {
+      "nominal_coverage": 0.8,
+      "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
+    },
+    "confidence_score": {
+      "available": false,
+      "reason": "Monthly retail forecast uses selected context features; per-day confidence is not applied."
+    }
+  },
+  "saved_to_sqlite": {
+    "run_id": 282,
+    "generated_at": "2026-11-05T13:03:01+00:00",
+    "saved_values": 10,
+    "graph_code": "graph4_monthly_retail"
+  },
+  "last_observation_date": "2026-10-01",
+  "data_staleness_days": 35,
+  "forecast_start_date": "2026-11-01",
+  "forecast_end_date": "2026-12-01",
+  "forecast_overall_confidence": {
+    "available": false,
+    "note": "Overall confidence applies to Graph 1/2 daily price forecasts only."
+  },
+  "warnings": [
+    "Shortfall = Consumption - (Arrival + Production). Positive values indicate potential shortfall; negative values indicate potential surplus."
+  ]
+}
+```
+
+---
+
+### 1.5 Graph 5: District Retail Price Forecast
+*Endpoint for viewing daily district-level retail onion prices with up to two selected districts.*
+
+- **Method**: `GET`
+- **Path**: `/api/graphs/district-retail`
+- **Description**: District-level daily retail onion price history and forecasts. Historical values come from MongoDB collection `district_wise_data`; forecast values come from `forecast_district_wise_data`. Both datasets are precomputed, so no model inference happens on the request path and no 180-day horizon cap is applied. Each request that returns at least one forecast row is persisted under `graph_code = graph5_district_retail` (`state_code` = district name, `target_key` = `retail`).
+
+#### Supported districts
+Exactly the 16 district columns present in `forecast_district_wise_data`. Names must match (case-insensitive reading is supported; do not fuzzy-match):
+
+`Ananthapuramu`, `Chittoor`, `East Godavari`, `Guntur`, `Kakinada`, `Konaseema`, `Krishna`, `Kurnool`, `Ntr`, `Palnadu`, `Parvathipuram Manyam`, `Prakasam`, `Srikakulam`, `Tirupati`, `Visakapatnam`, `Vizianagaram`
+
+#### Query Parameters:
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `districts` | string | **Yes** | — | Comma-separated list of 1 or 2 district names from the list above (case-insensitive; duplicates ignored). |
+| `start_date` | date | No | Earliest historical observation (2020-01-01) | First date to display, `YYYY-MM-DD`. |
+| `end_date` | date | No | Last available forecast date (2027-05-02) | Last date to display and forecast through, `YYYY-MM-DD`. Must be on or after `start_date`. |
+
+#### Behavior:
+- Historical dates span 2020-01-01 through the latest daily observation (e.g. 2026-11-03); forecast dates span the day after the last observation through 180 days ahead (e.g. 2026-11-04 → 2027-05-02). Rows are only returned inside the inclusive requested range.
+- Null/missing district cells are skipped; the nested `"Y"` helper field in the collections is ignored.
+- Historical rows carry `actual_price_rs_kg`; forecast rows carry `predicted_price_rs_kg`. `p10_rs_kg`, `p50_rs_kg`, and `p90_rs_kg` all equal the predicted value because the forecast dataset stores a single point value per district and day; no interval is produced on the request path.
+- A warning is included when historical observations end inside the requested window and precomputed forecasts complete the range.
+- HTTP 422 for: more than two districts ("Select one or two districts."), unknown district names (includes the allowed list), or `start_date` after `end_date`.
+
+#### Example Request:
+```http
+GET /api/graphs/district-retail?districts=Chittoor&start_date=2026-10-01&end_date=2026-11-30
+```
+
+#### Sample Output:
+```json
+{
+  "graph": "district_retail_forecast",
+  "title": "District Retail Onion Price Forecast",
+  "selected_districts": ["Chittoor"],
+  "supported_districts": ["Ananthapuramu", "Chittoor", "East Godavari", "Guntur", "Kakinada", "Konaseema", "Krishna", "Kurnool", "Ntr", "Palnadu", "Parvathipuram Manyam", "Prakasam", "Srikakulam", "Tirupati", "Visakapatnam", "Vizianagaram"],
+  "historical": [
+    {
+      "date": "2026-10-01",
+      "district": "Chittoor",
+      "actual_price_rs_kg": 44.0,
+      "unit": "INR/kg"
+    }
+  ],
+  "forecast": [
+    {
+      "date": "2026-11-04",
+      "district": "Chittoor",
+      "predicted_price_rs_kg": 34.3303,
+      "p10_rs_kg": 34.3303,
+      "p50_rs_kg": 34.3303,
+      "p90_rs_kg": 34.3303,
+      "unit": "INR/kg"
+    }
+  ],
+  "unit": "INR/kg",
+  "metadata": {
+    "model": "amazon/chronos-2",
+    "frequency": "daily",
+    "observation_price_unit": "INR/metric quintal",
+    "forecast_price_unit": "INR/kg",
+    "quantity_unit": "metric quintals/day",
+    "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
+    "prediction_interval": {
+      "nominal_coverage": 0.8,
+      "description": "P10–P90 is a nominal central 80% prediction interval, not a guarantee."
+    },
+    "confidence_score": {
+      "available": true,
+      "method": "tolerance_band_probability",
+      "applies_to": "Graph 1/2 daily price forecast rows",
+      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, assuming an asymmetric normal built from the Chronos-2 P10/P90 spread scaled by the spread multiplier k=1.7. Monotone (non-increasing) across forecast dates per series.",
+      "spread_multiplier_k": 1.7,
+      "tolerance_band_pct": 5.0,
+      "calibrated": false,
+      "note": "k is an uncalibrated placeholder; when the backtest supplies calibrated values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1."
+    }
+  },
+  "last_observation_date": "2026-11-03",
+  "data_staleness_days": 2,
+  "visible_start_date": "2026-10-01",
+  "visible_end_date": "2026-11-30",
+  "forecast_start_date": "2026-11-04",
+  "forecast_end_date": "2026-11-30",
+  "data_sources": {
+    "historical": "district_wise_data",
+    "forecast": "forecast_district_wise_data"
+  },
+  "saved_to_sqlite": {
+    "run_id": 280,
+    "generated_at": "2026-11-05T13:02:37+00:00",
+    "saved_values": 27,
+    "graph_code": "graph5_district_retail"
+  },
+  "warnings": [
+    "Historical observations end at 2026-11-03; the range through 2026-11-30 is completed with precomputed district forecasts."
+  ]
+}
+```
+
+`historical` and `forecast` are truncated to one row each in this sample; each row is
+repeated per requested district (`district` field) for every date in range. Because
+the forecast is served from precomputed data, `forecast_start_date` is the first
+precomputed forecast date within the requested window (the day after
+`last_observation_date`), not "today".
 
 ---
 
 ## 2. Forecast Persistence & Run History APIs
 
-Every Graph 1/2/3 forecast run is stored in MongoDB: the background scheduler persists a fresh full-grid run for Graphs 1/2 every `PRECOMPUTE_REFRESH_DAYS` days, fallback inference stores its run too, and each Graph 3 request persists its run. These endpoints allow querying stored runs.
+Every Graph 1/2/3/4/5 forecast run is stored in MongoDB: the background scheduler persists a fresh full-grid run for Graphs 1/2 every `PRECOMPUTE_REFRESH_DAYS` days, fallback inference stores its run too, and each Graph 3/4/5 request persists its run. These endpoints allow querying stored runs.
 
 ### 2.1 Get Latest Saved Forecast
 - **Method**: `GET`
@@ -488,7 +735,7 @@ Every Graph 1/2/3 forecast run is stored in MongoDB: the background scheduler pe
 #### Query Parameters:
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `graph_code` | string | No | `null` | Optional filter: `graph1_ap_prices`, `graph2_state_comparison`, or `graph3_supply_balance`. If omitted, returns the latest run across all graphs. |
+| `graph_code` | string | No | `null` | Optional filter: `graph1_ap_prices`, `graph2_state_comparison`, `graph3_supply_balance`, `graph4_monthly_retail`, or `graph5_district_retail`. If omitted, returns the latest run across all graphs. |
 
 #### Sample Output:
 ```json
@@ -581,7 +828,9 @@ parameters (and any optional filters) when calling a graph endpoint.
   "graphs": {
     "graph_1_ap_prices": "/api/graphs/ap-retail",
     "graph_2_state_comparison": "/api/graphs/state-comparison",
-    "graph_3_supply_balance": "/api/graphs/supply-balance"
+    "graph_3_supply_balance": "/api/graphs/supply-balance",
+    "graph_4_monthly_retail": "/api/graphs/monthly-retail",
+    "graph_5_district_retail": "/api/graphs/district-retail"
   },
   "ops": {
     "health": "/health",
@@ -791,7 +1040,7 @@ intercepted. Leave the CSV import endpoint on its separate `X-Ingestion-Key`.
 | `400 Bad Request` | Invalid filename | `sync-csv` filename contains path separators or does not end with `.csv`. |
 | `401 Unauthorized` | Invalid credentials | Bearer token is missing/invalid, or the `X-Ingestion-Key` header is missing/invalid for CSV import. |
 | `404 Not Found` | File not found | CSV file specified in `sync-csv` was not found in `data/`. |
-| `422 Unprocessable Entity` | Parameter validation error | Missing/malformed dates, `start_date` after `end_date`, an end date that produces an invalid forecast horizon, negative threshold, unsupported state/price type, or invalid CSV data. |
+| `422 Unprocessable Entity` | Parameter validation error | Missing/malformed dates, `start_date` after `end_date`, an end date that produces an invalid forecast horizon, negative threshold, unsupported state/price type, unsupported district or feature names (Graphs 4/5), or invalid CSV data. |
 | `500 Internal Server Error` | Execution error | Missing required column in the MongoDB store, or Chronos-2 pipeline failure. |
 | `503 Service Unavailable` | Service or Model not ready | Model dependencies missing, `API_BEARER_TOKEN` is not configured for protected API routes, or a unique `INGESTION_API_KEY` has not been configured for CSV import. |
 
