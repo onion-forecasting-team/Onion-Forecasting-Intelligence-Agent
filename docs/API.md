@@ -56,6 +56,20 @@ Every Graph 1 and Graph 2 response includes `forecast_overall_confidence` comput
 
 Not present for Graph 3 (`available: False`).
 
+### How the per-day `confidence_score` is built
+
+Each Graph 1/2 row's `confidence_score` is the derived probability (%; one decimal) that the actual price stays within ±`ONION_CONFIDENCE_TOLERANCE_PCT` (±5%) of the forecast median, assuming an asymmetric normal built from the Chronos-2 P10/P90 spread scaled by the series' spread multiplier `k` (converted through the z-score of the 0.9 quantile, Z90 = 1.2816). The score is a cumulative minimum across forecast dates within each series, so it can only stay level or fall with horizon. Reference point: when the P10/P90 distances equal the band width and `k` = 1, the score equals the nominal 80.
+
+`k` is calibrated **per price series** by split-conformal rolling-origin backtests (evidence in `data/calibration/`): Chronos-2 forecasts from one origin every 30 days at 90/180/365-day horizons are split chronologically 60/40 per origin; the first 26 origins (16,510 rows) calibrate k as the 80% order statistic of the asymmetric nonconformity scores `max(0, (P50−actual)/(P50−P10), (actual−P50)/(P90−P50))`; the last 18 origins validate that the calibrated bands cover ≥80% of realized actuals.
+
+| Series | k | Raw → calibrated validation coverage |
+|---|---|---|
+| Retail | 1.266404 | 79.42% → 90.20% |
+| Wholesale | 1.084111 | 87.21% → 89.66% |
+| Mandi modal | 1.260045 | 77.86% → 88.97% |
+
+Notes: pooled validation observations are not independent (~18 independent origins across ~605 realized dates); the pooled calibration includes a 365-day horizon regime the API never serves (cap: 180 days) — re-fitting on ≤180-day rows only gives wholesale 1.041855 / mandi modal 1.319127 (similar on-target coverage; recorded as a sensitivity analysis in `data/calibration/README.md`). `k` only reshapes the displayed score — the returned `p10_rs_kg`/`p50_rs_kg`/`p90_rs_kg` always remain the raw Chronos-2 quantiles.
+
 ---
 
 ## 1. Core Forecasting Graph APIs
@@ -188,11 +202,16 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
       "available": true,
       "method": "tolerance_band_probability",
       "applies_to": "Graph 1/2 daily price forecast rows",
-      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, computed from the Chronos-2 P10/P90 spread stretched by the calibration factor k. Monotone (non-increasing) across forecast dates per series.",
-      "spread_multiplier_k": 1.2,
+      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, assuming an asymmetric normal built from the Chronos-2 P10/P90 spread scaled by the per-series spread multiplier k (retail=1.266404, wholesale=1.084111, mandi_modal=1.260045). Monotone (non-increasing) across forecast dates per series.",
+      "spread_multiplier_k_by_series": {
+        "retail": 1.266404,
+        "wholesale": 1.084111,
+        "mandi_modal": 1.260045
+      },
+      "spread_multiplier_k": 1.266404,
       "tolerance_band_pct": 5.0,
-      "calibrated": false,
-      "note": "k=1.2 is an uncalibrated placeholder; when backtests supply calibrated values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1."
+      "calibrated": true,
+      "note": "Per-series k values are split-conformal calibrated from rolling-origin backtests (0.80 two-sided distance-to-median coverage; evidence CSVs in data/calibration/). Env keys ONION_CONFIDENCE_SPREAD_K_<SERIES> override the single ONION_CONFIDENCE_SPREAD_K per series; set ONION_CONFIDENCE_K_CALIBRATED=1 once backtest-calibrated values are configured."
     }
   },
   "saved_to_sqlite": {
@@ -302,11 +321,16 @@ GET /api/graphs/state-comparison?states=AP,MH&price_types=retail,wholesale&start
       "available": true,
       "method": "tolerance_band_probability",
       "applies_to": "Graph 1/2 daily price forecast rows",
-      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, computed from the Chronos-2 P10/P90 spread stretched by the calibration factor k. Monotone (non-increasing) across forecast dates per series.",
-      "spread_multiplier_k": 1.2,
+      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, assuming an asymmetric normal built from the Chronos-2 P10/P90 spread scaled by the per-series spread multiplier k (retail=1.266404, wholesale=1.084111, mandi_modal=1.260045). Monotone (non-increasing) across forecast dates per series.",
+      "spread_multiplier_k_by_series": {
+        "retail": 1.266404,
+        "wholesale": 1.084111,
+        "mandi_modal": 1.260045
+      },
+      "spread_multiplier_k": 1.266404,
       "tolerance_band_pct": 5.0,
-      "calibrated": false,
-      "note": "k=1.2 is an uncalibrated placeholder; when backtests supply calibrated values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1."
+      "calibrated": true,
+      "note": "Per-series k values are split-conformal calibrated from rolling-origin backtests (0.80 two-sided distance-to-median coverage; evidence CSVs in data/calibration/). Env keys ONION_CONFIDENCE_SPREAD_K_<SERIES> override the single ONION_CONFIDENCE_SPREAD_K per series; set ONION_CONFIDENCE_K_CALIBRATED=1 once backtest-calibrated values are configured."
     }
   },
   "saved_to_sqlite": {
@@ -714,11 +738,16 @@ GET /api/graphs/district-retail?districts=Chittoor&horizon_days=7
       "available": true,
       "method": "tolerance_band_probability",
       "applies_to": "Graph 1/2 daily price forecast rows",
-      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, assuming an asymmetric normal built from the Chronos-2 P10/P90 spread scaled by the spread multiplier k=1.7. Monotone (non-increasing) across forecast dates per series.",
-      "spread_multiplier_k": 1.7,
+      "description": "Derived per-day probability (%) that the actual price stays within ±5% of the forecast median, assuming an asymmetric normal built from the Chronos-2 P10/P90 spread scaled by the per-series spread multiplier k (retail=1.266404, wholesale=1.084111, mandi_modal=1.260045). Monotone (non-increasing) across forecast dates per series.",
+      "spread_multiplier_k_by_series": {
+        "retail": 1.266404,
+        "wholesale": 1.084111,
+        "mandi_modal": 1.260045
+      },
+      "spread_multiplier_k": 1.266404,
       "tolerance_band_pct": 5.0,
-      "calibrated": false,
-      "note": "k is an uncalibrated placeholder; when the backtest supplies calibrated values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1."
+      "calibrated": true,
+      "note": "Per-series k values are split-conformal calibrated from rolling-origin backtests (0.80 two-sided distance-to-median coverage; evidence CSVs in data/calibration/). Env keys ONION_CONFIDENCE_SPREAD_K_<SERIES> override the single ONION_CONFIDENCE_SPREAD_K per series; set ONION_CONFIDENCE_K_CALIBRATED=1 once backtest-calibrated values are configured."
     }
   },
   "last_observation_date": "2026-11-03",

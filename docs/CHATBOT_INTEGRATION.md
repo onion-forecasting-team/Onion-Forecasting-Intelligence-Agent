@@ -15,8 +15,8 @@ POST /api/chat  ──►  chat_router  ──►  agent.run_chat()
                        system prompt + last N messages + question
                                           │
                                           ▼
-                            Groq LLM (llama-3.3-70b-versatile,
-                            fallback llama-3.1-8b-instant)
+                            Groq LLM (config/.env: CHAT_LLM_MODEL,
+                            fallback CHAT_LLM_FALLBACK_MODEL)
                                           │  tool_calls (≤ CHAT_MAX_TOOL_ROUNDS)
                                           ▼
                         chatbot/tools.py executors  ── call ──►
@@ -66,7 +66,7 @@ Response (exact keys, `chart` is `null` when no forecast tool ran):
   "session_id": "…hex…",
   "answer": "markdown text …",
   "answer_format": "markdown",
-  "chart": { "graph": "ap_price_forecast", "...": "same JSON contract as FRONTEND_INTEGRATION.md" },
+  "chart": { "graph": "ap_price_forecast", "...": "same JSON contract as the Graph 1 endpoint (see docs/API.md §1.1)" },
   "chart_display": "collapsed",
   "tools_used": ["forecast_ap_prices"],
   "session_title": "What will AP retail price…",
@@ -118,7 +118,7 @@ storage migration).
 Chart payloads are **not persisted** (they are live Computations); titles auto-set from the
 first user message (≤ 48 chars).
 
-## Environment variables (see `.env.example`)
+## Environment variables (see `config/.env.example`)
 
 `GROQ_ENABLED` · `GROQ_API_KEY` · `GROQ_BASE_URL` · `CHAT_LLM_MODEL` ·
 `CHAT_LLM_FALLBACK_MODEL` · `CHAT_TEMPERATURE` · `CHAT_HISTORY_LIMIT` ·

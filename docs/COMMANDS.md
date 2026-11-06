@@ -3,19 +3,19 @@
 All commands assume you are in the project folder:
 
 ```powershell
-cd "C:\Users\syamm\OneDrive\Desktop\Onion Forecasting Intelligence\Onion-Forecasting-Intelligence"
+cd "C:\Users\syamm\OneDrive\Desktop\Onion Forecastijng intelligence agent\Onion-Forecasting-Intelligence-Agent"
 ```
 
-## 1. Daily-use commands (the job: `pull_upag_dash.py`)
+## 1. Daily-use commands (the job: `src\data_layer\pull_upag_dash.py`)
 
 | Purpose | Command |
 |---|---|
-| Look without touching anything (zero DB writes) | `.venv\Scripts\python.exe pull_upag_dash.py --dry-run --json` |
-| Run the ingestion now (yesterday's data) | `.venv\Scripts\python.exe pull_upag_dash.py --once --json` |
-| Re-check last N days (source published late) | `.venv\Scripts\python.exe pull_upag_dash.py --once --days 3 --json` |
-| Explicit date window | `.venv\Scripts\python.exe pull_upag_dash.py --once --from 2026-10-21 --to 2026-10-27 --json` |
-| Only some states | `.venv\Scripts\python.exe pull_upag_dash.py --once --states MP --json` |
-| Full-history reconciliation (2022 → yesterday) | `.venv\Scripts\python.exe pull_upag_dash.py --once --full-history --json` |
+| Look without touching anything (zero DB writes) | `.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --dry-run --json` |
+| Run the ingestion now (yesterday's data) | `.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --once --json` |
+| Re-check last N days (source published late) | `.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --once --days 3 --json` |
+| Explicit date window | `.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --once --from 2026-10-21 --to 2026-10-27 --json` |
+| Only some states | `.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --once --states MP --json` |
+| Full-history reconciliation (2022 → yesterday) | `.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --once --full-history --json` |
 
 Window rule: every run requests **yesterday = today (Asia/Kolkata) − 1**; the 4 runs per day
 (00:00 / 06:00 / 12:00 / 18:00) re-check the same date — first inserts, rest skip or correct.
@@ -24,13 +24,25 @@ Window rule: every run requests **yesterday = today (Asia/Kolkata) − 1**; the 
 
 | Purpose | Command |
 |---|---|
-| Install the 6-hourly automation | `.\setup_scheduler_6h.bat` |
-| Remove it | `.\remove_scheduler_6h.bat` |
+| Install the 6-hourly automation | `.\scripts\setup_scheduler_6h.bat` |
+| Remove it | `schtasks /delete /tn "OnionUPAgDash6h" /f` |
 | Check status + next run time | `schtasks /query /tn "OnionUPAgDash6h" /fo LIST` |
 | Trigger a run right now | `schtasks /run /tn "OnionUPAgDash6h"` |
 | Pause / resume without uninstalling | `schtasks /change /tn "OnionUPAgDash6h" /disable` / `/enable` |
+| Run the backend (enables the task while the server runs, disables on exit) | `.venv\Scripts\python.exe src\api\backend.py` |
 
-## 3. Verification
+## 3. API smoke checks
+
+```powershell
+# Backend health (open route, no token) — expect store_engine "mongodb" and model_loaded true
+curl.exe http://127.0.0.1:8000/health
+
+# Data/ingestion health (requires the bearer token)
+curl.exe -H "Authorization: Bearer <API_BEARER_TOKEN>" http://127.0.0.1:8000/api/ingestion/status
+curl.exe -H "Authorization: Bearer <API_BEARER_TOKEN>" http://127.0.0.1:8000/api/data/status
+```
+
+## 4. Verification
 
 ```powershell
 # Latest 3 dataset rows + their source label
@@ -46,14 +58,28 @@ Window rule: every run requests **yesterday = today (Asia/Kolkata) − 1**; the 
 # to the canonical schema names if your dump used them
 .venv\Scripts\python.exe scripts\align_collection_names.py
 
-# One-time: compare retained SQLite backup with the MongoDB store
+# One-time: rebuild counters from existing maxima (run after a restore)
+.venv\Scripts\python.exe scripts\bootstrap_counters.py
+
+# One-time: rebuild every mapped collection from the retained SQLite backup
+# (destructive to MongoDB content; guarded by --yes)
+.venv\Scripts\python.exe scripts\restore_from_sqlite_backup.py --yes
+
+# One-time: compare retained SQLite backup with the MongoDB store (read-only parity report)
 .venv\Scripts\python.exe scripts\verify_migration.py
 
-# Full offline test suite (runs against the throwaway onion_forecasting_test MongoDB DB)
+# One-time: regenerate the seed model-ready CSV from the retained SQLite backup
+.venv\Scripts\python.exe scripts\export_observations_csv.py
+
+# Recurring: confidence-reliability report (displayed score buckets vs realized
+# +/-5% band hit-rates over persisted Graph 1/2 price forecasts; read-only)
+.venv\Scripts\python.exe scripts\check_confidence_reliability.py
+
+# Full offline test suite (runs against the throwaway onion_forecasting_test MongoDB DB; expect 84 passed)
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-## 4. MongoDB backup & monitoring
+## 5. MongoDB backup & monitoring
 
 ```powershell
 # Full logical backup (install MongoDB Database Tools; one folder per date)
@@ -72,25 +98,27 @@ Other audit locations: `data\corrections_log.csv` (value corrections), `data\sna
 (raw responses, newest 30 kept), `data\pull_upag_dash.lock` (overlap guard — safe to
 delete if a run crashed and left a stale lock).
 
-## 4. From-scratch setup (new PC, or .venv deleted)
+## 6. From-scratch setup (new PC, or .venv deleted)
 
 ```powershell
-py -m venv .venv
-.venv\Scripts\python.exe -m pip install --no-cache-dir fastapi httpx pandas numpy requests python-dotenv pytest
-Copy-Item .env.example .env
-.venv\Scripts\python.exe -m pytest -q                        # 31 should pass
-.venv\Scripts\python.exe pull_upag_dash.py --dry-run --json  # sanity check
-.\setup_scheduler_6h.bat                                     # reinstall automation
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install --no-cache-dir -r requirements.txt
+Copy-Item config\.env.example config\.env   # then set MONGO_URI, API_BEARER_TOKEN, INGESTION_API_KEY
+.venv\Scripts\python.exe -m pytest -q                        # expect 84 passed
+.venv\Scripts\python.exe src\data_layer\pull_upag_dash.py --dry-run --json  # sanity check
+.\scripts\setup_scheduler_6h.bat                             # reinstall automation
+.venv\Scripts\python.exe src\api\backend.py                  # start API + enable the task
 ```
 
-Note: this venv is for ingestion + tests only. Running the forecasting API (`main.py`)
-additionally needs `torch` + `chronos` (`pip install torch chronos`).
+`requirements.txt` includes `torch` and `chronos-forecasting` — needed by the forecasting
+API; the first model use downloads the Chronos-2 weights.
 
-## 5. Troubleshooting quick map
+## 7. Troubleshooting quick map
 
 | Symptom | Check |
 |---|---|
-| Task exists but runs fail | `.venv` present? `.env` present with `UPAG_DASH_ENABLED=1`? |
+| API call returns 401 | Add `Authorization: Bearer <API_BEARER_TOKEN>`; the value must match `API_BEARER_TOKEN` in `config\.env` (an unconfigured token makes the API return 503 for /api/* routes) |
+| Task exists but runs fail | `.venv` present? `config\.env` present with `UPAG_DASH_ENABLED=1`? |
 | `inserted=0` but data is missing | Raise catch-up depth: `--days 3` (mandi rows publish late) |
 | One state failed, others ok | Per-state isolation is by design — see the per-state `error` in `--json` output and `ingestion_log` rows with `status='error'` |
 | Source changed column names/UOMs | Pipeline fails loudly (never guesses); inspect the newest snapshot in `data\snapshots\` |

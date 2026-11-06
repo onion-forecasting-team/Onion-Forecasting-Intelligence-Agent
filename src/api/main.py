@@ -49,12 +49,47 @@ MODEL_ID = os.getenv("CHRONOS_MODEL_ID", "amazon/chronos-2")
 MAX_FORECAST_HORIZON_DAYS = 180
 QUANTILES = [0.1, 0.5, 0.9]
 # Derived per-day forecast confidence (tolerance-band probability). The spread
-# multiplier k scales the Chronos-2 P10/P90 spread; replace the placeholder 1.2
-# with the backtest-calibrated value and set ONION_CONFIDENCE_K_CALIBRATED=1
-# once rolling-origin backtests have run.
+# multiplier k scales the Chronos-2 P10/P90 spread. k is backtest-calibrated per
+# price series via split-conformal calibration (0.80 two-sided distance-to-median
+# coverage, pooled across 90/180/365-day rolling-origin backtest horizons;
+# evidence CSVs in data/calibration/): retail 1.266404, wholesale 1.084111,
+# mandi_modal 1.260045. Per-series env keys
+# (ONION_CONFIDENCE_SPREAD_K_RETAIL/_WHOLESALE/_MANDI_MODAL) override the single
+# ONION_CONFIDENCE_SPREAD_K; unset per-series keys fall back to that single value.
 CONFIDENCE_SPREAD_K = float(os.getenv("ONION_CONFIDENCE_SPREAD_K", "1.2"))
 CONFIDENCE_TOLERANCE_PCT = float(os.getenv("ONION_CONFIDENCE_TOLERANCE_PCT", "0.05"))
 CONFIDENCE_K_CALIBRATED = os.getenv("ONION_CONFIDENCE_K_CALIBRATED", "").strip() == "1"
+
+_CONFIDENCE_K_ENV_KEYS = {
+    "retail": "ONION_CONFIDENCE_SPREAD_K_RETAIL",
+    "wholesale": "ONION_CONFIDENCE_SPREAD_K_WHOLESALE",
+    "mandi_modal": "ONION_CONFIDENCE_SPREAD_K_MANDI_MODAL",
+}
+
+
+def _load_confidence_spread_ks() -> dict[str, float]:
+    """Resolve the per-series spread multiplier k from the environment.
+
+    Each series reads ONION_CONFIDENCE_SPREAD_K_<SERIES> when set and otherwise
+    falls back to the single ONION_CONFIDENCE_SPREAD_K (and to the historic
+    default 1.2 when neither is configured). Raises ValueError with the exact
+    offending key when a configured value is not numeric.
+    """
+    resolved: dict[str, float] = {}
+    for price_type, env_key in _CONFIDENCE_K_ENV_KEYS.items():
+        raw = os.getenv(env_key, "").strip()
+        source = env_key
+        if not raw:
+            raw = os.getenv("ONION_CONFIDENCE_SPREAD_K", "1.2")
+            source = "ONION_CONFIDENCE_SPREAD_K"
+        try:
+            resolved[price_type] = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{source} must be a number, got {raw!r}") from exc
+    return resolved
+
+
+CONFIDENCE_SPREAD_K_BY_PRICE_TYPE = _load_confidence_spread_ks()
 Z90 = 1.2815515655446004  # standard normal z-score of the 0.9 quantile
 ALLOWED_HORIZONS = (7, 14, 30, 60, 90, 180)
 PRICE_TYPES = {"RETAIL": "retail",
@@ -431,19 +466,20 @@ def _normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
 
-def _confidence_score(q10: float, median: float, q90: float) -> float:
+def _confidence_score(q10: float, median: float, q90: float, spread_k: float) -> float:
     """Derived per-day confidence: probability (0-100, one decimal) that the actual
     value stays within +/-CONFIDENCE_TOLERANCE_PCT of the forecast median.
 
     1) The Chronos-2 spread around the median is stretched by the backtest
-       calibration multiplier CONFIDENCE_SPREAD_K.
+       calibration multiplier ``spread_k`` (one per price series; see
+       CONFIDENCE_SPREAD_K_BY_PRICE_TYPE).
     2) Each side's calibrated distance (median->P10, median->P90) is treated as a
        one-sided 0.90-quantile distance and converted to a sigma via Z90.
     3) The probability mass inside the [median*(1-tol), median*(1+tol)] band of
        that asymmetric normal is the per-day confidence.
     """
-    calibrated_q10 = median + CONFIDENCE_SPREAD_K * (q10 - median)
-    calibrated_q90 = median + CONFIDENCE_SPREAD_K * (q90 - median)
+    calibrated_q10 = median + spread_k * (q10 - median)
+    calibrated_q90 = median + spread_k * (q90 - median)
     calibrated_q10 = min(calibrated_q10, median)
     calibrated_q90 = max(calibrated_q90, median)
     s_lo = max((median - calibrated_q10) / Z90, 1e-9)
@@ -472,6 +508,7 @@ def _price_records_from_quantile_rows(
     metric-quintal model units before calling this builder).
     """
     col = PRICE_COLUMNS[state][price_type]
+    spread_k = CONFIDENCE_SPREAD_K_BY_PRICE_TYPE[price_type]
     latest_row = data.loc[pd.to_datetime(data["timestamp"]).idxmax()]
     latest_actual_price_rs_kg = float(latest_row[col]) / 100.0
     latest_actual_date = pd.Timestamp(latest_row["timestamp"]).date().isoformat()
@@ -487,13 +524,13 @@ def _price_records_from_quantile_rows(
         p10, p50, p90 = (round(value / 100.0, 4) for value in (q10, q50, q90))
         width = p90 - p10
         change_rs_kg = p50 - latest_actual_price_rs_kg
-        # Per-day confidence from the calibrated spread, computed on the same
-        # quantized values both paths contribute. The score is a cumulative
+        # Per-day confidence from the series' calibrated spread, computed on the
+        # same quantized values both paths contribute. The score is a cumulative
         # minimum across forecast dates (it may only stay level or decrease with
         # horizon), matching the pred["confidence_score"].cummin() post-process.
         running_min_confidence = min(
             running_min_confidence,
-            _confidence_score(p10 * 100.0, p50 * 100.0, p90 * 100.0))
+            _confidence_score(p10 * 100.0, p50 * 100.0, p90 * 100.0, spread_k))
 
         records.append({
             "date": row["date"],
@@ -756,6 +793,7 @@ def _status(data: pd.DataFrame, frequency: str = "daily") -> dict:
 
 
 def _metadata() -> dict:
+    ks = CONFIDENCE_SPREAD_K_BY_PRICE_TYPE
     return {"model": MODEL_ID, "frequency": "daily", "observation_price_unit": "INR/metric quintal",
             "forecast_price_unit": "INR/kg", "quantity_unit": "metric quintals/day",
             "quantiles": {"lower": 0.1, "median": 0.5, "upper": 0.9},
@@ -766,13 +804,20 @@ def _metadata() -> dict:
                                  "description": ("Derived per-day probability (%) that the actual price stays within "
                                                  f"±{CONFIDENCE_TOLERANCE_PCT * 100:.0f}% of the forecast median, assuming an "
                                                  "asymmetric normal built from the Chronos-2 P10/P90 spread scaled by "
-                                                 f"the spread multiplier k={CONFIDENCE_SPREAD_K}. Monotone (non-increasing) "
+                                                 "the per-series spread multiplier k "
+                                                 f"(retail={ks['retail']}, wholesale={ks['wholesale']}, "
+                                                 f"mandi_modal={ks['mandi_modal']}). Monotone (non-increasing) "
                                                  "across forecast dates per series."),
+                                 "spread_multiplier_k_by_series": {**ks},
                                  "spread_multiplier_k": CONFIDENCE_SPREAD_K,
                                  "tolerance_band_pct": CONFIDENCE_TOLERANCE_PCT * 100,
                                  "calibrated": CONFIDENCE_K_CALIBRATED,
-                                 "note": ("k is an uncalibrated placeholder; when the backtest supplies calibrated "
-                                          "values, set ONION_CONFIDENCE_SPREAD_K=<k> and ONION_CONFIDENCE_K_CALIBRATED=1.")}}
+                                 "note": ("Per-series k values are split-conformal calibrated from rolling-origin "
+                                          "backtests (0.80 two-sided distance-to-median coverage; evidence CSVs in "
+                                          "data/calibration/). Env keys ONION_CONFIDENCE_SPREAD_K_<SERIES> override "
+                                          "the single ONION_CONFIDENCE_SPREAD_K per series; set "
+                                          "ONION_CONFIDENCE_K_CALIBRATED=1 once backtest-calibrated values are "
+                                          "configured.")}}
 
 
 @app.get("/")

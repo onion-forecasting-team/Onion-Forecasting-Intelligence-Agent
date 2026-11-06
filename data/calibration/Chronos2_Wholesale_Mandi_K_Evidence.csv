@@ -1,0 +1,3 @@
+Target,Target column,Historical input covariates,Selected order-statistic score,Global K,Target coverage (%),Tolerance (percentage points),Calibration observations,Order statistic rank,Calibration origins,Validation origins,Validation observations,Original validation coverage (%),Calibrated validation coverage (%),Validation status
+AP Wholesale,AP_wholesale_rs_kg,"AP_mandi_modal_rs_kg, AP_arrival_t_day",1.0841114835138257,1.0841114835138257,80.0,5.0,16510,13209,26,18,7605,87.20578566732414,89.66469428007889,ABOVE TARGET BAND (OVERCOVERAGE)
+AP Mandi Modal,AP_mandi_modal_rs_kg,AP_arrival_t_day,1.2600449720830442,1.2600449720830442,80.0,5.0,16510,13209,26,18,7605,77.85667324128862,88.96778435239973,ABOVE TARGET BAND (OVERCOVERAGE)

@@ -10,6 +10,7 @@ from datetime import date
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 import db_client
 import history_store
@@ -772,3 +773,80 @@ def test_precompute_scheduler_refreshes_full_grid_then_reuses_fresh_runs(monkeyp
     assert served.status_code == 200, served.text
     assert len(served.json()["forecast"]) == 5
     assert served.json()["saved_to_sqlite"]["run_id"] == graph2_run_id
+
+
+# ---------------------------------------------------------------------------
+# Per-series confidence spread multiplier k (split-conformal calibrated)
+# ---------------------------------------------------------------------------
+
+CALIBRATED_KS = {"retail": 1.266404, "wholesale": 1.084111, "mandi_modal": 1.260045}
+
+
+def test_confidence_k_env_has_calibrated_values():
+    """config/.env supplies the backtest-calibrated per-series k values."""
+    assert main.CONFIDENCE_SPREAD_K_BY_PRICE_TYPE == pytest.approx(CALIBRATED_KS)
+    assert main.CONFIDENCE_K_CALIBRATED is True
+
+
+def test_confidence_k_per_series_env_overrides_and_single_key_fallback(monkeypatch):
+    monkeypatch.setenv("ONION_CONFIDENCE_SPREAD_K", "1.5")
+    for env_key in main._CONFIDENCE_K_ENV_KEYS.values():
+        monkeypatch.delenv(env_key, raising=False)
+
+    # Without per-series keys, every series falls back to the single value.
+    assert main._load_confidence_spread_ks() == pytest.approx(
+        {"retail": 1.5, "wholesale": 1.5, "mandi_modal": 1.5})
+
+    # Per-series keys override the single value; unset series still fall back.
+    monkeypatch.setenv("ONION_CONFIDENCE_SPREAD_K_WHOLESALE", "1.084111")
+    monkeypatch.setenv("ONION_CONFIDENCE_SPREAD_K_MANDI_MODAL", "1.260045")
+    resolved = main._load_confidence_spread_ks()
+    assert resolved == pytest.approx(
+        {"retail": 1.5, "wholesale": 1.084111, "mandi_modal": 1.260045})
+
+    # Historic default applies when neither key layer is configured.
+    monkeypatch.delenv("ONION_CONFIDENCE_SPREAD_K", raising=False)
+    monkeypatch.delenv("ONION_CONFIDENCE_SPREAD_K_WHOLESALE", raising=False)
+    monkeypatch.delenv("ONION_CONFIDENCE_SPREAD_K_MANDI_MODAL", raising=False)
+    assert main._load_confidence_spread_ks() == pytest.approx(
+        {"retail": 1.2, "wholesale": 1.2, "mandi_modal": 1.2})
+
+
+def test_confidence_k_invalid_value_raises_with_key_name(monkeypatch):
+    monkeypatch.setenv("ONION_CONFIDENCE_SPREAD_K_WHOLESALE", "not-a-number")
+    with pytest.raises(ValueError, match="ONION_CONFIDENCE_SPREAD_K_WHOLESALE"):
+        main._load_confidence_spread_ks()
+
+
+def test_confidence_score_applies_spread_multiplier():
+    score_lo = main._confidence_score(95.0, 100.0, 105.0, spread_k=1.0)
+    score_hi = main._confidence_score(90.0, 100.0, 110.0, spread_k=2.0)
+    # A larger k stretches the spread into wider sigmas -> less band mass.
+    assert 0.0 < score_hi < score_lo < 100.0
+
+
+def test_graph1_each_series_uses_its_own_spread_multiplier(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    # Same relative spread for all rows in the fake pipeline; differentiating k
+    # per series must then differentiate the confidence scores by k alone.
+    monkeypatch.setattr(main, "CONFIDENCE_SPREAD_K_BY_PRICE_TYPE",
+                        {"retail": 1.0, "wholesale": 2.0, "mandi_modal": 1.5})
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail,wholesale&start_date=2026-10-27&end_date=2026-11-29",
+        headers={"Authorization": "Bearer test-api-token"},
+    )
+    assert response.status_code == 200, response.text
+    rows = response.json()["forecast"]
+    retail = [r["confidence_score"] for r in rows if r["price_type"] == "retail"]
+    wholesale = [r["confidence_score"] for r in rows if r["price_type"] == "wholesale"]
+    assert len(retail) == len(wholesale) == 32
+    # k=1.0 stretches nothing; k=2.0 doubles the spread and lowers the band mass.
+    assert all(rs > ws for rs, ws in zip(retail, wholesale))
+
+
+def test_metadata_reports_per_series_k(monkeypatch, tmp_path):
+    client_with_fake(monkeypatch, tmp_path)
+    metadata = main._metadata()["confidence_score"]
+    assert metadata["spread_multiplier_k_by_series"] == pytest.approx(CALIBRATED_KS)
+    assert metadata["calibrated"] is True
+    assert "retail" in metadata["description"] and "mandi_modal" in metadata["description"]
