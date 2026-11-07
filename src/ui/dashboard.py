@@ -114,6 +114,68 @@ def forecast_hover_data(forecast: pd.DataFrame) -> tuple[Any, str]:
     )
 
 
+def graph1_overlay_figure(upag_payload: dict, avaghana_payload: dict) -> go.Figure:
+    """Graph 1 'Both' mode: UPAG (live) and Avaghana (static snapshot) on one chart."""
+    fig = go.Figure()
+    type_labels = {"retail": "Retail price", "wholesale": "Wholesale price",
+                   "mandi_modal": "Mandi modal price"}
+    upag_hist = pd.DataFrame(upag_payload.get("historical", []))
+    upag_fc = pd.DataFrame(upag_payload.get("forecast", []))
+    for ptype in upag_payload.get("price_types", []):
+        color = PRICE_COLORS.get(ptype, PRICE_COLORS["wholesale"])
+        label = type_labels.get(ptype, ptype)
+        hist = upag_hist[upag_hist["price_type"] == ptype]
+        pred = upag_fc[upag_fc["price_type"] == ptype]
+        group = f"upag_{ptype}"
+        if not hist.empty:
+            fig.add_trace(go.Scatter(
+                x=hist["date"], y=hist["actual_price_rs_kg"], mode="lines",
+                name=f"UPAG · {label} · actual", line={"color": color, "width": 2.3},
+                legendgroup=group,
+            ))
+        if not pred.empty:
+            if pred["p10_rs_kg"].notna().all():
+                add_forecast_band(fig, pred["date"], pred["p10_rs_kg"], pred["p90_rs_kg"],
+                                  color, f"UPAG · {label} · P10–P90", group)
+            hover_data, hover_template = forecast_hover_data(pred)
+            fig.add_trace(go.Scatter(
+                x=pred["date"], y=pred["predicted_price_rs_kg"], mode="lines",
+                customdata=hover_data,
+                name=f"UPAG · {label} · forecast P50",
+                line={"color": color, "width": 2.7, "dash": "dash"},
+                legendgroup=group, hovertemplate=hover_template,
+            ))
+    av_color = "#8e44ad"
+    av_hist = pd.DataFrame(avaghana_payload.get("historical", []))
+    av_fc = pd.DataFrame(avaghana_payload.get("forecast", []))
+    if not av_hist.empty:
+        fig.add_trace(go.Scatter(
+            x=av_hist["date"], y=av_hist["actual_price_rs_kg"], mode="lines",
+            name="Avaghana · retail · actual", line={"color": av_color, "width": 2.3},
+            legendgroup="avaghana",
+        ))
+    if not av_fc.empty and av_fc["p10_rs_kg"].notna().all():
+        add_forecast_band(fig, av_fc["date"], av_fc["p10_rs_kg"], av_fc["p90_rs_kg"],
+                          av_color, "Avaghana · retail · P10–P90", "avaghana")
+    if not av_fc.empty:
+        fig.add_trace(go.Scatter(
+            x=av_fc["date"], y=av_fc["predicted_price_rs_kg"], mode="lines",
+            name="Avaghana · retail · pre-generated forecast",
+            line={"color": av_color, "width": 2.7, "dash": "dash"},
+            legendgroup="avaghana",
+            hovertemplate="Date: %{x}<br>Avaghana forecast: ₹%{y:.2f}/kg<extra></extra>",
+        ))
+    threshold = avaghana_payload.get("threshold_rs_kg", upag_payload.get("threshold_rs_kg", 44.0))
+    fig.add_hline(
+        y=threshold, line_dash="dash", line_color="#d9534f",
+        annotation_text=f"Threshold ₹{threshold:g}/kg", annotation_position="top left",
+    )
+    boundary = upag_payload.get("forecast_start_date") or avaghana_payload.get("forecast_start_date")
+    fig.add_vline(x=boundary, line_dash="dot", line_color="#8d96a5", opacity=.7)
+    configure_chart(fig, height=440)
+    return fig
+
+
 def set_freshness(payload: dict) -> None:
     last_date = payload.get("last_observation_date")
     if last_date:
@@ -195,34 +257,58 @@ st.markdown('''<div class="hero">
 # API only returns 90 days of actuals for the chart.
 # ---------------------------------------------------------------------------
 section_heading("AP retail price forecast", "Andhra Pradesh onion prices · Last 3 months of actuals and the selected forecast horizon")
+source_mode = st.radio(
+    "Data source",
+    ["UPAG (live)", "Avaghana (static)", "Both — UPAG vs Avaghana"],
+    index=0, key="g1_source", horizontal=True,
+    help=("UPAG: live dataset updated by the 6-hourly ingestion job, forecasted by the "
+          "Chronos-2 pipeline. Avaghana: static district-derived retail snapshot with a "
+          "pre-generated six-month forecast. Both: draws both sources on one graph."),
+)
 c1, c2 = st.columns([1.35, 1.2])
 with c1:
     range1 = date_range_control("g1_date_range", "Date range")
 with c2:
-    opt1, opt2, opt3 = st.columns(3)
-    with opt1:
-        show_retail = st.checkbox("Retail price", value=True, key="g1_retail")
-    with opt2:
-        show_wholesale = st.checkbox("Wholesale price", value=False, key="g1_wholesale")
-    with opt3:
-        show_mandi = st.checkbox("Mandi modal price", value=False, key="g1_mandi")
+    if source_mode == "UPAG (live)":
+        opt1, opt2, opt3 = st.columns(3)
+        with opt1:
+            show_retail = st.checkbox("Retail price", value=True, key="g1_retail")
+        with opt2:
+            show_wholesale = st.checkbox("Wholesale price", value=False, key="g1_wholesale")
+        with opt3:
+            show_mandi = st.checkbox("Mandi modal price", value=False, key="g1_mandi")
+    else:
+        st.caption("Retail price only — the Avaghana dataset provides the "
+                   "district-derived state-average retail price.")
+        show_retail, show_wholesale, show_mandi = True, False, False
 run1 = st.button("Update AP forecast", type="primary", key="g1_run")
 if run1:
     api_get.clear()
     st.session_state["g1_started"] = True
 if run1 or st.session_state.get("g1_started", False):
-    selected_price_types = []
-    if show_retail:
-        selected_price_types.append("retail")
-    if show_wholesale:
-        selected_price_types.append("wholesale")
-    if show_mandi:
-        selected_price_types.append("mandi_modal")
-    if not selected_price_types:
-        st.session_state["g1_error"] = "Select retail, wholesale, and/or mandi modal price."
+    selection_error = None
+    if source_mode == "UPAG (live)":
+        selected_price_types = []
+        if show_retail:
+            selected_price_types.append("retail")
+        if show_wholesale:
+            selected_price_types.append("wholesale")
+        if show_mandi:
+            selected_price_types.append("mandi_modal")
+        if not selected_price_types:
+            selection_error = "Select retail, wholesale, and/or mandi modal price."
+    else:
+        selected_price_types = ["retail"]
+    if selection_error:
+        st.session_state["g1_error"] = selection_error
         st.session_state.pop("g1_payload", None)
     else:
-        with st.spinner("Running Chronos-2 on the full available historical context..."):
+        with st.spinner(
+            "Comparing sources: running Chronos-2 for UPAG and loading the static Avaghana snapshot..."
+            if source_mode == "Both — UPAG vs Avaghana"
+            else "Loading the static Avaghana snapshot..." if source_mode == "Avaghana (static)"
+            else "Running Chronos-2 on the full available historical context..."
+        ):
             try:
                 st.session_state["g1_payload"] = fetch_graph(
                     "/api/graphs/ap-retail",
@@ -230,105 +316,172 @@ if run1 or st.session_state.get("g1_started", False):
     "price_types": ",".join(selected_price_types),
     "start_date": range1[0].isoformat(),
     "end_date": range1[1].isoformat(),
+    "source": {"UPAG (live)": "upag", "Avaghana (static)": "avaghana",
+               "Both — UPAG vs Avaghana": "both"}[source_mode],
 },
                 )
+                st.session_state["g1_payload_source"] = {
+                    "UPAG (live)": "upag", "Avaghana (static)": "avaghana",
+                    "Both — UPAG vs Avaghana": "both"}[source_mode]
                 st.session_state["g1_error"] = None
             except Exception as exc:
                 st.session_state["g1_error"] = str(exc)
 if st.session_state.get("g1_error"):
     st.error(st.session_state["g1_error"])
 payload1 = st.session_state.get("g1_payload")
+payload1_source = st.session_state.get("g1_payload_source", "upag")
 if payload1:
-    set_freshness(payload1)
-    hdf = pd.DataFrame(payload1.get("historical", []))
-    fdf = pd.DataFrame(payload1.get("forecast", []))
-    if not hdf.empty and not fdf.empty:
-        fig1 = go.Figure()
-        for ptype in payload1.get("price_types", []):
-            color = PRICE_COLORS.get(ptype, PRICE_COLORS["wholesale"])
-            label = {"retail": "Retail price", "wholesale": "Wholesale price", "mandi_modal": "Mandi modal price"}.get(ptype, ptype)
-            hist = hdf[hdf["price_type"] == ptype]
-            pred = fdf[fdf["price_type"] == ptype]
-            if not hist.empty:
-                fig1.add_trace(go.Scatter(
-                    x=hist["date"], y=hist["actual_price_rs_kg"], mode="lines",
-                    name=f"{label} · actual", line={"color": color, "width": 2.3},
-                    legendgroup=ptype,
-                ))
-            if not pred.empty:
-                add_forecast_band(fig1, pred["date"], pred["p10_rs_kg"], pred["p90_rs_kg"], color, f"{label} · P10–P90", ptype)
-                hover_data, hover_template = forecast_hover_data(pred)
-                fig1.add_trace(go.Scatter(
-                    x=pred["date"], y=pred["predicted_price_rs_kg"], mode="lines",
-                    customdata=hover_data,
-                    name=f"{label} · forecast P50", line={"color": color, "width": 2.7, "dash": "dash"},
-                    legendgroup=ptype,
-                    hovertemplate=hover_template,
-                ))
-        threshold1 = payload1.get("threshold_rs_kg", 44.0)
-        fig1.add_hline(
-            y=threshold1,
-            line_dash="dash",
-            line_color="#d9534f",
-            annotation_text=f"Threshold ₹{threshold1:g}/kg",
-            annotation_position="top left",
-        )
-        # Mark the boundary between latest actual and future forecast.
-        fig1.add_vline(x=payload1.get("forecast_start_date"), line_dash="dot", line_color="#8d96a5", opacity=.7)
-        configure_chart(fig1, height=420)
+    if payload1_source == "both" and "upag" in payload1 and "avaghana" in payload1:
+        upag_payload = payload1.get("upag", {})
+        av_payload = payload1.get("avaghana", {})
+        ds = av_payload.get("source_dataset", {})
+        src_c1, src_c2 = st.columns(2)
+        with src_c1:
+            st.caption(f"UPAG (live) · actuals through {upag_payload.get('actual_end_date')} · "
+                       f"forecast {upag_payload.get('forecast_start_date')} → "
+                       f"{upag_payload.get('forecast_end_date')}")
+            overall = upag_payload.get("forecast_overall_confidence")
+            if overall and overall.get("overall_confidence_score") is not None:
+                st.caption(f"UPAG overall confidence (selected range): "
+                           f"mean {overall.get('overall_confidence_score')}% · "
+                           f"min {overall.get('minimum_confidence_score')}% · "
+                           f"final {overall.get('final_confidence_score')}%")
+        with src_c2:
+            st.caption(f"Avaghana (static) · actuals through {ds.get('last_observation_date')} · "
+                       f"pre-generated forecast {ds.get('forecast_start_date')} → "
+                       f"{ds.get('forecast_end_date')}")
+            if av_payload.get("source_dataset", {}).get("forecast_quantiles") == "median only":
+                st.caption("Avaghana forecast: median only · confidence not calibrated "
+                           "for this series yet.")
+            else:
+                st.caption("Avaghana confidence: not calibrated for this series yet.")
+        fig1 = graph1_overlay_figure(upag_payload, av_payload)
         st.plotly_chart(fig1, use_container_width=True)
-
-        # Compare the first forecast with the latest actual returned by the API.
-        metrics = []
-        for ptype in payload1.get("price_types", []):
-            pred = fdf[fdf["price_type"] == ptype]
-            if not pred.empty:
-                label = {"retail": "AP retail", "wholesale": "AP wholesale", "mandi_modal": "AP mandi modal"}.get(ptype, ptype)
-                metrics.append((label, pred.sort_values("date").iloc[0]))
-        if metrics:
-            cols = st.columns(len(metrics))
-            for col, (label, forecast_row) in zip(cols, metrics):
-                actual = forecast_row.get("latest_actual_price_rs_kg")
-                actual_date = forecast_row.get("latest_actual_date")
-                change_percent = forecast_row.get("change_percent")
-                direction = forecast_row.get("change_direction")
-                delta = (
-                    f"{change_percent:+.2f}% · {direction}"
-                    if pd.notna(change_percent) and direction
-                    else "Change fields missing from API"
-                )
-                col.metric(
-                    f"{label} · latest actual",
-                    f"₹{actual:.2f}/kg" if pd.notna(actual) else "Unavailable",
-                    delta=delta,
-                )
-                confidence = forecast_row.get("confidence_score")
-                confidence_text = (
-                    f" · Confidence {confidence:.1f}%"
-                    if confidence is not None and pd.notna(confidence)
-                    else ""
-                )
-                col.caption(
-                    f"Baseline {actual_date or 'unavailable'} · First forecast "
-                    f"₹{forecast_row['predicted_price_rs_kg']:.2f}/kg "
-                    f"({forecast_row['date']}) · P10 ₹{forecast_row['p10_rs_kg']:.2f} "
-                    f"· P90 ₹{forecast_row['p90_rs_kg']:.2f}{confidence_text}"
-                )
-        # Overall confidence for the selected forecast range (mean / min / final).
-        overall = payload1.get("forecast_overall_confidence")
-        if overall:
-            st.info(
-                f"Overall forecast confidence (this horizon): "
-                f"mean = {overall.get('overall_confidence_score', 'N/A')}% | "
-                f"minimum = {overall.get('minimum_confidence_score', 'N/A')}% | "
-                f"final = {overall.get('final_confidence_score', 'N/A')}%  "
-                f"(computed from {overall.get('forecast_points_for_overall', 0)} forecast points)"
-            )
+        udf = pd.DataFrame(upag_payload.get("forecast", []))
+        adf = pd.DataFrame(av_payload.get("forecast", []))
         with st.expander("Forecast rows / API values"):
-            st.dataframe(fdf, use_container_width=True, hide_index=True)
-        st.download_button("Download AP price forecast CSV", fdf.to_csv(index=False), file_name=f"ap_price_forecast_{payload1['horizon_days']}d.csv", mime="text/csv", key="g1_download")
+            st.caption("UPAG (live) forecast rows")
+            st.dataframe(udf, use_container_width=True, hide_index=True)
+            st.caption("Avaghana (static) forecast rows")
+            st.dataframe(adf, use_container_width=True, hide_index=True)
+        st.download_button("Download UPAG forecast CSV", udf.to_csv(index=False),
+                           file_name="upag_ap_price_forecast.csv", mime="text/csv",
+                           key="g1_download_upag")
+        st.download_button("Download Avaghana forecast CSV", adf.to_csv(index=False),
+                           file_name="avaghana_ap_price_forecast.csv", mime="text/csv",
+                           key="g1_download_avaghana")
+    else:
+        is_avaghana = payload1_source == "avaghana" or payload1.get("data_source") == "avaghana"
+        set_freshness(payload1)
+        hdf = pd.DataFrame(payload1.get("historical", []))
+        fdf = pd.DataFrame(payload1.get("forecast", []))
+        if not hdf.empty and not fdf.empty:
+            fig1 = go.Figure()
+            for ptype in payload1.get("price_types", []):
+                color = PRICE_COLORS.get(ptype, PRICE_COLORS["wholesale"])
+                source_prefix = "Avaghana · " if is_avaghana else ""
+                label = f"{source_prefix}{'Retail price' if ptype == 'retail' else 'Wholesale price' if ptype == 'wholesale' else 'Mandi modal price'}"
+                hist = hdf[hdf["price_type"] == ptype]
+                pred = fdf[fdf["price_type"] == ptype]
+                if not hist.empty:
+                    fig1.add_trace(go.Scatter(
+                        x=hist["date"], y=hist["actual_price_rs_kg"], mode="lines",
+                        name=f"{label} · actual", line={"color": color, "width": 2.3},
+                        legendgroup=ptype,
+                    ))
+                if not pred.empty:
+                    # Avaghana shipments are median-only until quantiles are provided.
+                    if pred["p10_rs_kg"].notna().all():
+                        add_forecast_band(fig1, pred["date"], pred["p10_rs_kg"], pred["p90_rs_kg"], color, f"{label} · P10–P90", ptype)
+                    if is_avaghana:
+                        hover_data, hover_template = None, (
+                            f"Date: %{{x}}<br>{label} forecast: ₹%{{y:.2f}}/kg<extra></extra>")
+                    else:
+                        hover_data, hover_template = forecast_hover_data(pred)
+                    fig1.add_trace(go.Scatter(
+                        x=pred["date"], y=pred["predicted_price_rs_kg"], mode="lines",
+                        customdata=hover_data,
+                        name=f"{label} · forecast P50", line={"color": color, "width": 2.7, "dash": "dash"},
+                        legendgroup=ptype,
+                        hovertemplate=hover_template,
+                    ))
+            threshold1 = payload1.get("threshold_rs_kg", 44.0)
+            fig1.add_hline(
+                y=threshold1,
+                line_dash="dash",
+                line_color="#d9534f",
+                annotation_text=f"Threshold ₹{threshold1:g}/kg",
+                annotation_position="top left",
+            )
+            # Mark the boundary between latest actual and future forecast.
+            fig1.add_vline(x=payload1.get("forecast_start_date"), line_dash="dot", line_color="#8d96a5", opacity=.7)
+            configure_chart(fig1, height=420)
+            st.plotly_chart(fig1, use_container_width=True)
+
+            # Compare the first forecast with the latest actual returned by the API.
+            metrics = []
+            for ptype in payload1.get("price_types", []):
+                pred = fdf[fdf["price_type"] == ptype]
+                if not pred.empty:
+                    full_label = {"retail": "AP retail", "wholesale": "AP wholesale", "mandi_modal": "AP mandi modal"}.get(ptype, ptype)
+                    metrics.append((f"{'Avaghana · ' if is_avaghana else ''}{full_label}", pred.sort_values("date").iloc[0]))
+            if metrics:
+                cols = st.columns(len(metrics))
+                for col, (label, forecast_row) in zip(cols, metrics):
+                    actual = forecast_row.get("latest_actual_price_rs_kg")
+                    actual_date = forecast_row.get("latest_actual_date")
+                    change_percent = forecast_row.get("change_percent")
+                    direction = forecast_row.get("change_direction")
+                    delta = (
+                        f"{change_percent:+.2f}% · {direction}"
+                        if pd.notna(change_percent) and direction
+                        else "Change fields missing from API"
+                    )
+                    col.metric(
+                        f"{label} · latest actual",
+                        f"₹{actual:.2f}/kg" if pd.notna(actual) else "Unavailable",
+                        delta=delta,
+                    )
+                    confidence = forecast_row.get("confidence_score")
+                    if is_avaghana:
+                        col.caption(
+                            f"Baseline {actual_date} · Pre-generated static forecast "
+                            f"₹{forecast_row['predicted_price_rs_kg']:.2f}/kg "
+                            f"({forecast_row['date']}) · median only, no calibrated interval"
+                        )
+                    else:
+                        confidence_text = (
+                            f" · Confidence {confidence:.1f}%"
+                            if confidence is not None and pd.notna(confidence)
+                            else ""
+                        )
+                        col.caption(
+                            f"Baseline {actual_date or 'unavailable'} · First forecast "
+                            f"₹{forecast_row['predicted_price_rs_kg']:.2f}/kg "
+                            f"({forecast_row['date']}) · P10 ₹{forecast_row['p10_rs_kg']:.2f} "
+                            f"· P90 ₹{forecast_row['p90_rs_kg']:.2f}{confidence_text}"
+                        )
+            # Overall confidence for the selected forecast range (mean / min / final).
+            overall = payload1.get("forecast_overall_confidence")
+            if is_avaghana:
+                st.caption("Tolerance-band confidence is not provided for the static "
+                           "Avaghana snapshot (no calibration evidence for this series yet).")
+            elif overall:
+                st.info(
+                    f"Overall forecast confidence (this horizon): "
+                    f"mean = {overall.get('overall_confidence_score', 'N/A')}% | "
+                    f"minimum = {overall.get('minimum_confidence_score', 'N/A')}% | "
+                    f"final = {overall.get('final_confidence_score', 'N/A')}%  "
+                    f"(computed from {overall.get('forecast_points_for_overall', 0)} forecast points)"
+                )
+            with st.expander("Forecast rows / API values"):
+                st.dataframe(fdf, use_container_width=True, hide_index=True)
+            st.download_button("Download AP price forecast CSV", fdf.to_csv(index=False), file_name=f"ap_price_forecast_{payload1['horizon_days']}d.csv", mime="text/csv", key="g1_download")
 else:
-    st.info("Choose any combination of retail, wholesale and mandi modal prices, select a horizon, then click Update AP forecast.")
+    st.info(
+        "Choose the data source (UPAG live, Avaghana static snapshot, or Both), select a "
+        "horizon, then click Update AP forecast."
+    )
 
 st.markdown('<hr class="section-rule"/>', unsafe_allow_html=True)
 

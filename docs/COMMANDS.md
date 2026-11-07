@@ -75,7 +75,12 @@ curl.exe -H "Authorization: Bearer <API_BEARER_TOKEN>" http://127.0.0.1:8000/api
 # +/-5% band hit-rates over persisted Graph 1/2 price forecasts; read-only)
 .venv\Scripts\python.exe scripts\check_confidence_reliability.py
 
-# Full offline test suite (runs against the throwaway onion_forecasting_test MongoDB DB; expect 84 passed)
+# Avaghana static dataset (Graph 1 second source): survey the CSVs (read-only) or
+# replace both collections after a newer dataset + forecast arrives (then restart the backend)
+.venv\Scripts\python.exe scripts\import_avaghana.py
+.venv\Scripts\python.exe scripts\import_avaghana.py --yes
+
+# Full offline test suite (runs against the throwaway onion_forecasting_test MongoDB DB; expect 91 passed)
 .venv\Scripts\python.exe -m pytest -q
 ```
 

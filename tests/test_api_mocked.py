@@ -83,6 +83,27 @@ def client_with_fake(monkeypatch, tmp_path):
     monkeypatch.setenv("PRECOMPUTE_SCHEDULER_ENABLED", "0")
     main._PREDICTION_CACHE.clear()
     FakeChronosPipeline.calls = []
+    # Static Avaghana snapshot (three history rows + one ignored Methodology doc;
+    # three median-only forecast rows right after the last history day).
+    db = db_client.get_db(TEST_DB_NAME)
+    db["Avaghana_AP_Retail_Dataset"].insert_many([
+        {"Date": "2026-10-23", "AP_Avaghana_Retail_State_Average": 40.0,
+         "Districts_Contributing": 25, "District_Coverage_Percent": 96.2,
+         "Coverage_Status": "GOOD (21-26 districts)", "source_sheet": "State Daily Output"},
+        {"Date": "2026-10-24", "AP_Avaghana_Retail_State_Average": 40.5,
+         "Districts_Contributing": 26, "District_Coverage_Percent": 100.0,
+         "Coverage_Status": "GOOD (21-26 districts)", "source_sheet": "State Daily Output"},
+        {"Date": "2026-10-25", "AP_Avaghana_Retail_State_Average": 41.0,
+         "Districts_Contributing": 26, "District_Coverage_Percent": 98.1,
+         "Coverage_Status": "GOOD (21-26 districts)", "source_sheet": "State Daily Output"},
+        {"Date": "2026-10-25", "Krishna": 39.9, "source_sheet": "District Daily Input"},
+        {"Metric": "Districts", "Value": 26, "source_sheet": "Methodology"},
+    ])
+    db["AVAGHANA_AP_FORECAST"].insert_many([
+        {"Date": f"2026-10-{day:02d}", "Retail": 41.0 + (day - 25) * 0.2}
+        for day in (26, 27, 28)
+    ])
+    main._avaghana_cache_clear()
     return TestClient(main.app)
 
 
@@ -850,3 +871,119 @@ def test_metadata_reports_per_series_k(monkeypatch, tmp_path):
     assert metadata["spread_multiplier_k_by_series"] == pytest.approx(CALIBRATED_KS)
     assert metadata["calibrated"] is True
     assert "retail" in metadata["description"] and "mandi_modal" in metadata["description"]
+
+
+# ---------------------------------------------------------------------------
+# Graph 1 — Avaghana static second data source
+# ---------------------------------------------------------------------------
+
+AVAGHANA_HEADERS = {"Authorization": "Bearer test-api-token"}
+
+
+def test_graph1_default_source_is_upag_and_unchanged(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    FakeChronosPipeline.calls = []
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-27&end_date=2026-10-29",
+        headers=AVAGHANA_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["graph"] == "ap_price_forecast"
+    assert "avaghana" not in body and "upag" not in body
+    assert FakeChronosPipeline.calls  # default path still runs the live pipeline
+    assert all("data_source" not in row for row in body["forecast"])
+
+
+def test_graph1_avaghana_serves_static_rows_without_model(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    FakeChronosPipeline.calls = []
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-24&end_date=2026-10-28"
+        "&source=avaghana",
+        headers=AVAGHANA_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Zero model work: the forecast is served from the pre-generated collection.
+    assert FakeChronosPipeline.calls == []
+    assert body["data_source"] == "avaghana"
+    assert body["price_types"] == ["retail"]
+    assert [(h["date"], h["actual_price_rs_kg"]) for h in body["historical"]] == [
+        ("2026-10-24", 40.5), ("2026-10-25", 41.0)]
+    assert [f["date"] for f in body["forecast"]] == ["2026-10-26", "2026-10-27", "2026-10-28"]
+    first = body["forecast"][0]
+    assert first["latest_actual_date"] == "2026-10-25"
+    assert first["latest_actual_price_rs_kg"] == 41.0
+    assert first["p50_rs_kg"] == pytest.approx(41.2)
+    assert first["p10_rs_kg"] is None and first["p90_rs_kg"] is None
+    assert all(row["confidence_score"] is None for row in body["forecast"])
+    assert body["metadata"]["confidence_score"]["available"] is False
+    assert body["source_dataset"]["forecast_rows"] == 3
+    assert body["source_dataset"]["forecast_quantiles"] == "median only"
+
+
+def test_graph1_avaghana_ignores_non_retail_with_warning(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail,wholesale&start_date=2026-10-24"
+        "&end_date=2026-10-26&source=avaghana",
+        headers=AVAGHANA_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["price_types"] == ["retail"]
+    assert any("wholesale" in warning for warning in body["warnings"])
+    assert {row["price_type"] for row in body["forecast"]} == {"retail"}
+
+
+def test_graph1_both_source_returns_independent_blocks(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-27&end_date=2026-10-29"
+        "&source=both",
+        headers=AVAGHANA_HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["source"] == "both"
+    assert body["upag"]["graph"] == "ap_price_forecast"
+    assert body["avaghana"]["data_source"] == "avaghana"
+    assert FakeChronosPipeline.calls  # UPAG block still uses the live pipeline
+    assert isinstance(body["upag"]["forecast"], list)
+    assert len(body["avaghana"]["forecast"]) == 2  # 2026-10-27 and 2026-10-28
+
+
+def test_graph1_avaghana_empty_collection_fails_closed(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    db = db_client.get_db(TEST_DB_NAME)
+    db["AVAGHANA_AP_FORECAST"].delete_many({})
+    main._avaghana_cache_clear()
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-24&end_date=2026-10-26"
+        "&source=avaghana",
+        headers=AVAGHANA_HEADERS,
+    )
+    assert response.status_code == 503
+    assert "never regenerates" in response.json()["detail"]
+
+
+def test_graph1_invalid_source_rejected(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    response = client.get(
+        "/api/graphs/ap-retail?price_types=retail&start_date=2026-10-27&end_date=2026-10-29"
+        "&source=bogus",
+        headers=AVAGHANA_HEADERS,
+    )
+    assert response.status_code == 422
+    assert "source must be one of" in response.json()["detail"]
+
+
+def test_data_status_reports_avaghana_block(monkeypatch, tmp_path):
+    client = client_with_fake(monkeypatch, tmp_path)
+    body = client.get("/api/data/status", headers=AVAGHANA_HEADERS).json()
+    avaghana = body["avaghana"]
+    assert avaghana["available"] is True and avaghana["static"] is True
+    assert avaghana["forecast_rows"] == 3
+    assert avaghana["forecast_start_date"] == "2026-10-26"
+    assert avaghana["forecast_end_date"] == "2026-10-28"

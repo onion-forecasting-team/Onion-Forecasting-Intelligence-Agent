@@ -11,7 +11,7 @@ This project is a local, runnable MVP using separate daily price and AP monthly 
 
 ## What is included
 
-- **Graph 1 API/UI:** Forecasts AP retail, wholesale, and mandi modal prices using the specified AP price and arrival history.
+- **Graph 1 API/UI:** Forecasts AP retail, wholesale, and mandi modal prices using the specified AP price and arrival history. Supports two independently retrievable data sources selected by the `source` parameter (`upag` live pipeline — default —, `avaghana` static district-derived state-average retail snapshot with a pre-generated six-month forecast stored in `Avaghana_AP_Retail_Dataset`/`AVAGHANA_AP_FORECAST`, or `both` for a single-graph comparison). The backend never regenerates the Avaghana forecast; refreshing it means re-importing newer data with `scripts/import_avaghana.py`.
 - **Graph 2 API/UI:** Forecasts retail, wholesale, and mandi modal prices independently for AP, MH, KA, and MP using only each selected state's matching price and arrival history.
 - **Graph 3 API/UI:** Forecasts AP monthly production, consumption, and arrivals in tonnes/month, then derives shortfall as `consumption - (arrival + production)`.
 - **Graph 4 API/UI:** Forecasts AP monthly retail prices (₹/kg) over the monthly dataset, with optional wholesale/mandi price and supply-demand features as covariates.
@@ -30,6 +30,7 @@ This project is a local, runnable MVP using separate daily price and AP monthly 
 4. Graph 3 quantities are monthly totals supplied by the BA team. Validate the definitions of production, consumption, and arrivals before interpreting the resulting shortfall.
 5. Shortfall quantile bounds are conservative combinations of individual component quantiles, not a calibrated joint interval.
 6. UPAg credentials alone do not prove that a source provides the fields required by the model. First list the sources authorized to the account and inspect the exact response schema. The included UPAg utility fetches **raw data only**; it does not silently map unknown source columns into the model-ready dataset.
+7. The Avaghana Graph 1 source is a static snapshot (history 2020-01-01 → 2026-11-03 plus a pre-generated six-month forecast). It is an equally weighted district average, not a volume-weighted official state average; the stored forecast is median-only (no P10/P90), so Avaghana rows carry no prediction-interval fields and no tolerance-band confidence score, and the price unit still needs BA-team confirmation (the dataset's own Methodology sheet flags it).
 
 ## Recommended environment
 
@@ -199,7 +200,7 @@ The scheduled job fetches UPAg Dash data and writes it to MongoDB and the config
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-The suite (3 test files, 84 tests) monkeypatches Chronos-2 and runs against a throwaway `onion_forecasting_test` database on the configured MongoDB store, verifying the five graph response shapes plus chat, ingestion, and CORS behavior. To confirm real forecasting, run the service and request one graph endpoint with the actual model installed.
+The suite (3 test files, 91 tests) monkeypatches Chronos-2 and runs against a throwaway `onion_forecasting_test` database on the configured MongoDB store, verifying the five graph response shapes plus chat, ingestion, and CORS behavior. To confirm real forecasting, run the service and request one graph endpoint with the actual model installed.
 
 
 ## v4 graph-specific model logic and persisted forecasts

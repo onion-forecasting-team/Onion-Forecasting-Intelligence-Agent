@@ -125,6 +125,13 @@ save a forecast. Graph 3 returns month-start points up to the same 180-day limit
 | `start_date` | date | Yes | — | `YYYY-MM-DD` | First date to include in returned actual and forecast records. |
 | `end_date` | date | Yes | — | `YYYY-MM-DD`; requests beyond 180 days return the maximum supported forecast range | Requested last date. If beyond the limit, response includes forecasts only through `forecast_limit_date` and sets `forecast_truncated` to `true`. |
 | `threshold_rs_kg` | number | No | `44.0` | Greater than or equal to `0` | Chart reference threshold in INR/kg; echoed in the response. |
+| `source` | string | No | `upag` | `upag`, `avaghana`, `both` | Data source. Any other value returns `422`. |
+
+#### Data sources:
+- **`source=upag` (default)** — the live UPAG dataset (updated by the 6-hourly ingestion job), forecasted by the on-device Chronos-2 pipeline (DB-first path or on-demand inference). Request shape and payload are identical to earlier releases; existing callers do not need to send `source`.
+- **`source=avaghana`** — static Avaghana snapshot served entirely from two MongoDB collections: history from `Avaghana_AP_Retail_Dataset` ("State Daily Output" sheet, district-derived state-average daily retail prices) and the pre-generated six-month Chronos-2 forecast from `AVAGHANA_AP_FORECAST`. The backend **never regenerates** this forecast; when the collections are empty the endpoint responds `503` with an import instruction, not a fallback inference. Refreshing the snapshot means importing a newer dataset + forecast again (see `scripts/import_avaghana.py`); until then the staleness fields grow as usual — the data is static by design.
+- Avaghana is retail-only (state-level); `price_types` other than `retail` are not returned for this source (a warning lists the ignored types). Stored forecast rows currently carry the median only, so `p10_rs_kg`/`p90_rs_kg`, interval fields and `confidence_score` are `null` and the `metadata.confidence_score` block reports `available: false` with the reason. A `source_dataset` block exposes the snapshot provenance (collections, row counts, date ranges, quantile availability).
+- **`source=both`** — returns `upag` and `avaghana` sub-payloads (each shaped like the single-source response), `source: "both"`, and top-level `warnings`.
 
 #### Target & Covariate Logic:
 - **`retail`**: Context uses Date + AP Retail + AP Wholesale + AP Mandi Modal + AP Arrivals. Future covariates are independently forecast first.
@@ -236,6 +243,98 @@ GET /api/graphs/ap-retail?price_types=retail,wholesale,mandi_modal&start_date=20
   ]
 }
 ```
+
+#### Sample Output — `source=avaghana` (static snapshot, trimmed):
+```json
+{
+  "graph": "ap_price_forecast",
+  "title": "Andhra Pradesh Onion Price Forecast — Avaghana (static snapshot)",
+  "state": "AP",
+  "price_types": ["retail"],
+  "unit": "INR/kg",
+  "data_source": "avaghana",
+  "source_dataset": {
+    "type": "static_snapshot",
+    "history_collection": "Avaghana_AP_Retail_Dataset",
+    "forecast_collection": "AVAGHANA_AP_FORECAST",
+    "history_rows": 2499,
+    "history_start_date": "2020-01-01",
+    "last_observation_date": "2026-11-03",
+    "forecast_rows": 180,
+    "forecast_start_date": "2026-11-04",
+    "forecast_end_date": "2027-05-02",
+    "forecast_quantiles": "median only",
+    "updates": "Manual re-import of newer dataset + forecast (scripts/import_avaghana.py); not part of the 6-hourly ingestion."
+  },
+  "historical": [
+    {
+      "date": "2026-11-01",
+      "state": "AP",
+      "price_type": "retail",
+      "price_type_label": "Retail price",
+      "data_source": "avaghana",
+      "actual_price_rs_kg": 38.4212,
+      "districts_contributing": 24,
+      "district_coverage_percent": 92.3,
+      "coverage_status": "GOOD (21-26 districts)"
+    }
+  ],
+  "forecast": [
+    {
+      "date": "2026-11-04",
+      "state": "AP",
+      "price_type": "retail",
+      "data_source": "avaghana",
+      "latest_actual_date": "2026-11-03",
+      "latest_actual_price_rs_kg": 38.6151,
+      "predicted_price_rs_kg": 38.8711,
+      "change_rs_kg": 0.256,
+      "change_percent": 0.66,
+      "change_direction": "increase",
+      "p10_rs_kg": null,
+      "p50_rs_kg": 38.8711,
+      "p90_rs_kg": null,
+      "prediction_interval_width_rs_kg": null,
+      "interval_width_pct_of_median": null,
+      "confidence_score": null
+    }
+  ],
+  "forecast_overall_confidence": {
+    "overall_confidence_score": null,
+    "minimum_confidence_score": null,
+    "final_confidence_score": null,
+    "forecast_points_for_overall": 0
+  },
+  "metadata": {
+    "confidence_score": {
+      "available": false,
+      "reason": "confidence_score is None on Avaghana rows: the stored forecast is median-only and no split-conformal calibration evidence exists for the Avaghana district-derived state-average series yet.",
+      "data_source": "avaghana"
+    }
+  },
+  "saved_to_sqlite": null,
+  "last_observation_date": "2026-11-03",
+  "forecast_start_date": "2026-11-04",
+  "forecast_end_date": "2027-05-02",
+  "warnings": [
+    "Avaghana is a static snapshot: history through 2026-11-03, pre-generated forecast through 2027-05-02. It is not updated by the 6-hourly ingestion job."
+  ]
+}
+```
+
+#### Sample Output — `source=both` (shape, trimmed):
+```json
+{
+  "graph": "ap_price_forecast",
+  "title": "Andhra Pradesh Onion Price Forecast — UPAG vs Avaghana",
+  "source": "both",
+  "state": "AP",
+  "unit": "INR/kg",
+  "upag": { "graph": "ap_price_forecast", "historical": [], "forecast": [], "metadata": {} },
+  "avaghana": { "graph": "ap_price_forecast", "data_source": "avaghana", "historical": [], "forecast": [], "source_dataset": {} }
+}
+```
+Each sub-payload carries the full single-source response shape; the Avaghana side always reports `price_types: ["retail"]` regardless of the UPAG side's selection.
 
 ---
 
